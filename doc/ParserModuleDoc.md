@@ -1,0 +1,412 @@
+# 输入解析模块设计文档
+
+## 文档状态
+
+- 文档类型：模块设计文档
+- 所属流程：输入解析阶段
+- 当前阶段：MVP 设计
+- MVP 范围：支持单个或多个 MCAP 文件解析、排序、对齐和插值
+
+## 功能描述
+
+输入解析模块负责将输入文件解析为按主时间轴对齐的结构化数据。
+
+本模块只保证文件解析、topic 数据抽取、时间戳排序、时间同步和插值结果准确。事件切分由后续事件生成模块负责，Parser 不负责判断事件边界。
+
+当前阶段仅支持 MCAP 文件。后续可扩展支持视频加机器人日志组合文件、LeRobot 数据集等格式。
+
+## 架构设计
+
+本模块采用工厂模式加抽象基类的整体架构。
+
+核心抽象：
+
+- `ParserBase`：文件解析基类。不同文件类型实现不同解析器，例如 `McapParser`。
+- `AlignBase`：数据对齐基类。不同对齐策略实现不同对齐器。
+- `InsertBase`：数据插值基类。不同插值算法实现不同插值器。
+
+第一版实现：
+
+- `McapParser`：解析单个或多个 MCAP 文件。
+- `ConditionalInsertAligner`：基于主时间轴进行条件插值对齐。
+- `DefaultInserter`：实现图像最近邻、普通向量线性插值、`pose7d` 专用插值。
+
+后续如果需要替换姿态插值算法，可以新增插值实例并注册到插值工厂，不需要改动 Parser 主流程。
+
+## 模块请求格式
+
+服务编排层会将 `basic_config`、`parser_config` 和运行时字段组合成 Parser 模块请求。
+
+```json
+{
+  "basic": {
+    "task_id": "TASK-001",
+    "job_id": "JOB-001"
+  },
+  "parser": {
+    "folder_path": "本地目录或 S3 地址",
+    "file_type": "mcap",
+    "topics": {
+      "cameras": [
+        {
+          "name": "wrist_left",
+          "topic": "/camera/wrist_left/image",
+          "role": "image",
+          "parser": "image",
+          "format": "raw",
+          "encoding": "bgr8",
+          "width": 640,
+          "height": 480,
+          "required": true,
+          "missing_policy": "error"
+        }
+      ],
+      "state": [
+        {
+          "name": "left_arm.pose",
+          "topic": "/left_arm/tcp_pose",
+          "role": "state",
+          "parser": "pose7d",
+          "dtype": "float32",
+          "shape": [7],
+          "fields": [
+            "position.x",
+            "position.y",
+            "position.z",
+            "orientation.x",
+            "orientation.y",
+            "orientation.z",
+            "orientation.w"
+          ],
+          "required": true,
+          "missing_policy": "error"
+        }
+      ],
+      "action": [
+        {
+        "name": "right_gripper",
+        "topic": "/gripper/gripper_r/data",
+        "role": "gripper",
+        "parser": "gripper",
+        "dtype": "float32",
+        "fields": ["angle"],
+        "shape": [1],
+        "required": false,
+        "sync_policy": "3",
+        "missing_policy": "zero",
+        "group": "right"
+        }
+      ]
+    }
+  },
+  "align": {
+    "main_time_topic": "/camera/wrist_left/image",
+    "method": "conditional_insert"
+  },
+  "insert": {
+    "rotation": "ZYX",
+    "max_tor_time": 3
+  },
+  "output_format": {
+    "include_vector_view": true,
+    "include_component_schema": true
+  }
+}
+```
+
+## 字段说明
+
+### basic
+
+- `task_id`：业务任务 ID，由服务入口传入或生成。
+- `job_id`：运行任务 ID，由服务编排层生成。MVP 阶段可为空。
+
+### parser
+
+- `folder_path`：输入文件所在目录。本地路径直接读取；S3 地址需要先调用后端下载模块获取本地临时目录。
+- `file_type`：输入文件类型。MVP 阶段仅支持 `mcap`。
+- `topics.cameras`：图像 topic 配置。
+- `topics.state`：状态 topic 配置。
+- `topics.action`：动作 topic 配置。
+
+### topic item
+
+- `name`：输出中的稳定 key，用于区分多臂、多夹爪、底盘等多个同类型 topic。
+- `topic`：原始 topic 名称。
+- `role`：topic 角色，例如 `image`、`state`、`action`、`joint_state`、`gripper`。
+- `parser`：解析模式，例如 `image`、`vector`、`pose7d`。
+- `dtype`：输出数据类型，默认 `float32`。
+- `shape`：输出向量形状。
+- `fields`：字段抽取路径，支持属性取值和下标取值。
+- `missing_policy`：缺失值处理策略。
+- `format`：图像格式，例如 `raw`、`jpeg`、`png`。
+- `encoding`：图像 encoding，例如 `rgb8`、`bgr8`、`mono8`。
+- `width`、`height`：图像尺寸。
+
+## 字段抽取规则
+
+字段路径只描述 message 内部字段，不需要和 topic 字符串拼接。
+
+示例：
+
+```text
+topic = "/example/topic/data"
+fields = ["position.x", "data[2]", "orientation.w"]
+```
+
+表示从 `/example/topic/data` 对应 message 中读取：
+
+```text
+message.position.x
+message.data[2]
+message.orientation.w
+```
+
+## missing_policy
+
+MVP 阶段仅支持以下策略：
+
+- `error`：缺失时直接报错。
+- `zero`：缺失时填充 0。
+- `previous`：缺失时填充前值；如果前值不存在，退化为 `zero`。
+
+第一版不支持 `null`，因为输出需要保持数值结构稳定，便于 numpy、parquet 和训练数据消费。
+
+## 时间单位约定
+
+模块内部计算使用原始纳秒时间戳，避免高精度对齐时出现浮点精度损失。
+
+对齐阈值 `insert.max_tor_time` 的单位为纳秒。
+
+模块对外输出同时保留两种时间表示：
+
+- `timestamp_ns`：`int64`，用于排序、对齐、插值、去重和下游精确计算。
+- `timestamp_sec`：字符串或浮点展示值，用于日志、人工检查和前端展示。
+
+如果下游只能接收一种时间，优先使用 `timestamp_ns`。
+
+## 文档解析流程
+
+1. 判断 `folder_path` 是否为 S3 地址。
+2. 如果是 S3 地址，调用后端下载模块下载到本地临时目录。
+3. 根据 `file_type` 选择解析器。MVP 阶段仅允许 `mcap`。
+4. 根据 `topics` 配置读取图像、state、action 等数据。
+5. 所有 topic 数据按 `timestamp_ns` 排序。
+6. 输出解析后的 `images` 和 `values`。
+
+## 多 MCAP 合并规则
+
+MVP 阶段支持单个或多个 MCAP 文件。
+
+合并规则：
+
+1. 多个 MCAP 文件解析后，所有 topic 数据必须按 `timestamp_ns` 全局排序。
+2. 不允许依赖 MCAP 文件传入顺序或文件名顺序。
+3. 不允许同一 topic 在多个 MCAP 文件中出现重叠时间段；发现重叠直接报错。
+4. 不允许同一 topic 出现相同 `timestamp_ns` 的多条消息；发现重复直接报错。
+
+重复数据示例：
+
+```text
+file_a.mcap: /camera/front @ 1000000000ns
+file_b.mcap: /camera/front @ 1000000000ns
+```
+
+或同一个 MCAP 内：
+
+```text
+/camera/front @ 1000000000ns frame_A
+/camera/front @ 1000000000ns frame_B
+```
+
+MVP 阶段采用严格策略：同 topic 同 timestamp 重复直接失败，避免静默污染训练数据。
+
+## 数据对齐流程
+
+1. 使用 `align.main_time_topic` 作为主时间轴。
+2. 只保留主时间轴中有效的主帧。
+3. 其他 camera topic 使用最近邻图像。
+4. state/action topic 根据 `insert.max_tor_time` 判断使用最近邻还是插值。
+5. 输出四个并行列表，并保证同一 index 的数据来自同一个主帧时间。
+
+## 插值规则
+
+### 图像插值
+
+图像使用最近邻策略，不做图像内容插值。
+
+解析阶段需要保留原始图像信息：二进制数据、图像格式、图像 encoding、图像 width 和 height，以及可选 decoded array。
+
+黑帧、重复帧、静止帧等质量问题由后续数据质检模块处理。
+
+### 普通向量插值
+
+对一维或多维数值向量使用线性插值。
+
+如果最近数据点与主帧时间差小于等于 `insert.max_tor_time`，直接采用最近邻值。
+
+### pose7d 插值
+
+当 `parser` 为 `pose7d` 时，数据结构为：
+
+```text
+[x, y, z, qx, qy, qz, qw]
+```
+
+MVP 阶段为保持与后续算法一致，采用以下策略：
+
+1. `[x, y, z]` 使用线性插值。
+2. `[qx, qy, qz, qw]` 先按 `insert.rotation` 转成欧拉角。
+3. 对欧拉角进行旋转插值。
+4. 再按 `insert.rotation` 转回四元数。
+5. 拼接为 `[new_x, new_y, new_z, new_qx, new_qy, new_qz, new_qw]`。
+
+风险说明：欧拉角插值可能存在角度跳变和万向节锁风险。后续可新增基于四元数 SLERP 的插值实例，并通过插值工厂注册切换。
+
+## 解析输出 schema
+
+解析后输出两个字典对象，分别保存图像和数值信息。
+
+```python
+images = {
+    "topic": [
+        {
+            "timestamp_ns": 1000000000,
+            "timestamp_sec": "1.000000000",
+            "raw": b"...",
+            "format": "raw",
+            "encoding": "bgr8",
+            "width": 640,
+            "height": 480,
+            "array": None
+        }
+    ]
+}
+
+values = {
+    "topic": [
+        {
+            "timestamp_ns": 1000000000,
+            "timestamp_sec": "1.000000000",
+            "value": np.ndarray([...])
+        }
+    ]
+}
+```
+
+## 对齐输出 schema
+
+输出四个并行列表，所有列表依据 index 对齐。
+
+```python
+timestamp_list = [
+    {
+        "timestamp_ns": 1000000000,
+        "timestamp_sec": "1.000000000"
+    }
+]
+
+image_list = [
+    {
+        "wrist_left": {
+            "raw": b"...",
+            "format": "raw",
+            "encoding": "bgr8",
+            "width": 640,
+            "height": 480,
+            "array": None,
+            "source_topic": "/camera/wrist_left/image"
+        }
+    }
+]
+
+state_list = [
+    {
+        "left_arm.pose": np.ndarray([...]),
+        "right_arm.pose": np.ndarray([...])
+    }
+]
+
+action_list = [
+    {
+        "left_arm.target_pose": np.ndarray([...])
+    }
+]
+```
+
+如果 `output_format.include_vector_view` 为 `true`，额外输出按配置顺序拼接后的 vector view：
+
+```python
+state_vector_list = [np.ndarray([...])]
+action_vector_list = [np.ndarray([...])]
+```
+
+如果 `output_format.include_component_schema` 为 `true`，额外输出组件 schema：
+
+```python
+state_schema = [
+    {
+        "key": "left_arm.pose",
+        "topic": "/left_arm/tcp_pose",
+        "parser": "pose7d"
+        "offset": 0,
+        "shape": [7],
+        "dtype": "float32"
+    }
+]
+```
+
+## 模块输出格式
+
+```python
+{
+    "timestamp_list": timestamp_list,
+    "image_list": image_list,
+    "state_list": state_list,
+    "action_list": action_list,
+    "state_vector_list": state_vector_list,
+    "action_vector_list": action_vector_list,
+    "state_schema": state_schema,
+    "action_schema": action_schema
+}
+```
+
+`state_vector_list`、`action_vector_list`、`state_schema`、`action_schema` 是否输出由 `output_format` 控制。
+
+## 异常处理规则
+
+MVP 阶段采用 fail-fast 策略。
+
+直接失败：
+
+- 配置不是合法 JSON。
+- `file_type` 不是 `mcap`。
+- 输入路径不存在。
+- 必需 topic 缺失。
+- 主时间轴 topic 缺失。
+- 多 MCAP 中同 topic 时间段重叠。
+- 同 topic 同 timestamp 重复。
+- `insert.max_tor_time` 不是非负整数纳秒。
+
+可退化处理：
+
+- 可选 topic 缺失：按 `missing_policy` 处理。
+- 可选字段缺失：按 `missing_policy` 处理。
+- 图像无法解码：保留 raw bytes，记录异常，交由数据质检模块处理。
+
+错误日志必须包含：`task_id`、`job_id`、文件名、topic、`timestamp_ns`、错误类型和错误原因。
+
+## MVP 验收标准
+
+1. 可以解析 `tests/train_data_1.mcap`。
+2. 可以处理单个 MCAP 和多个 MCAP 输入。
+3. 输出 topic 数据按 `timestamp_ns` 排序。
+4. 主时间轴输出单调递增。
+5. camera、state、action 都能按配置输出。
+6. `missing_policy` 的 `error`、`zero`、`previous` 都有测试覆盖。
+7. 多 MCAP 重叠时间段会报错。
+8. 同 topic 同 timestamp 重复会报错。
+
+## 更新记录
+
+- 2026-07-07：补充配置层级、时间单位、多 MCAP 合并、图像 raw 信息、missing_policy、异常策略和 MVP 验收标准。
