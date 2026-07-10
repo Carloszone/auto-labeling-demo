@@ -180,10 +180,12 @@ MVP 阶段仅支持以下策略：
 
 模块对外输出同时保留两种时间表示：
 
-- `timestamp_ns`：`int64`，用于排序、对齐、插值、去重和下游精确计算。
-- `timestamp_sec`：字符串或浮点展示值，用于日志、人工检查和前端展示。
+- `timestamp_ns`：字符串格式的纳秒时间戳，用于排序、对齐、插值、去重和下游精确计算；参与计算时由实现层转换为整数。
+- `timestamp_sec`：字符串格式的秒级时间戳，用于日志、人工检查和前端展示。
 
 如果下游只能接收一种时间，优先使用 `timestamp_ns`。
+
+所有模块对外输出的时间戳字段统一使用字符串格式，包括纳秒时间戳和秒级时间戳。需要排序、比较、插值或精度计算时，由模块内部显式转换为整数或高精度数值，计算完成后再转换为字符串输出。
 
 ## 文档解析流程
 
@@ -271,7 +273,7 @@ MVP 阶段为保持与后续算法一致，采用以下策略：
 images = {
     "topic": [
         {
-            "timestamp_ns": 1000000000,
+            "timestamp_ns": "1000000000",
             "timestamp_sec": "1.000000000",
             "raw": b"...",
             "format": "raw",
@@ -286,7 +288,7 @@ images = {
 values = {
     "topic": [
         {
-            "timestamp_ns": 1000000000,
+            "timestamp_ns": "1000000000",
             "timestamp_sec": "1.000000000",
             "value": np.ndarray([...])
         }
@@ -301,7 +303,7 @@ values = {
 ```python
 timestamp_list = [
     {
-        "timestamp_ns": 1000000000,
+        "timestamp_ns": "1000000000",
         "timestamp_sec": "1.000000000"
     }
 ]
@@ -348,7 +350,7 @@ state_schema = [
     {
         "key": "left_arm.pose",
         "topic": "/left_arm/tcp_pose",
-        "parser": "pose7d"
+        "parser": "pose7d",
         "offset": 0,
         "shape": [7],
         "dtype": "float32"
@@ -398,7 +400,7 @@ MVP 阶段采用 fail-fast 策略。
 
 ## MVP 验收标准
 
-1. 可以解析 `tests/train_data_1.mcap`。
+1. 可以通过运行时传入的本地 MCAP 路径完成解析；默认测试样例为 `tests/train_data_1.mcap`。
 2. 可以处理单个 MCAP 和多个 MCAP 输入。
 3. 输出 topic 数据按 `timestamp_ns` 排序。
 4. 主时间轴输出单调递增。
@@ -409,4 +411,5 @@ MVP 阶段采用 fail-fast 策略。
 
 ## 更新记录
 
+- 2026-07-10：修正 `state_schema` 示例中的字段分隔符。
 - 2026-07-07：补充配置层级、时间单位、多 MCAP 合并、图像 raw 信息、missing_policy、异常策略和 MVP 验收标准。
