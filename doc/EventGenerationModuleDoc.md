@@ -3,180 +3,181 @@
 ## 文档状态
 
 - 文档类型：模块设计文档
-- 所属流程：事件生成阶段
+- 所属流程：事件生成与切分阶段
 - 当前阶段：MVP 设计
-- MVP 范围：基于前序模块的输出，实现对事件（`event`）的节点识别
+- MVP 范围：消费 DataCheck 输出的无标签变化节点，按摄像头 topic 独立生成事件节点与事件区间
 
 ## 功能描述
 
-事件生成模块负责基于数据质检结果生成事件节点，为后续事件标注提供输入。
-当前阶段只需要实现基于异常区间信息生成事件节点的方法，不直接生成事件时间段。
+事件生成模块是“检测事实”与“业务事件”之间的策略层。DataCheck 负责检测变化位置，本模块负责将合法 trigger 转为事件节点，并构造事件区间。
+
+本模块不读取原始 MCAP，不重复执行平滑、clinear 或 HSMM，也不从质量异常区间推导节点。当前不执行额外业务筛选，不为节点增加“运动开始”“恢复稳定”等阶段标签。
+
+多个摄像头 topic 必须保持相互独立：节点按 `topic_key` 分组、组内排序和配对，禁止跨 topic 组成区间。
 
 ## 输入
 
-本模块的输入有两个来源：
-1. 来自数据检测模块的 `data_anomaly_ranges`、`img_anomaly_ranges`，其中异常区间已经包含起止时间戳和起止 index
-2. 来源于外部请求的参数信息。具体接受的参数见`接口定义`部分
+1. DataCheck 输出的 `trigger_points`。
+2. Parser 输出的 `timestamp_list`，用于校验节点并生成半闭半开区间。
+3. 节点筛选策略和区间配对策略。
+
+`data_anomaly_ranges` 和 `img_anomaly_ranges` 不作为事件节点来源。
 
 ## 输出
-
-事件生成模块输出一个字典对象，MVP 阶段核心字段为 `event_points`。
 
 ```text
 {
     "task_id": "TASK-001",
     "job_id": "JOB-001",
     "event_points": {
-        1: {
-            "timestamp_ns": "1000000000",
-            "timestamp_sec": "1.000000000",
-            "timestamp_index": 3,
-            "anomaly_code": 1001,
-            "anomaly_name": "oscillation",
-            "source": "data",
-            "is_merged": false
+        "left_image": {
+            1: {
+                "timestamp_ns": "1000000000",
+                "timestamp_sec": "1.000000000",
+                "timestamp_index": 30,
+                "topic_key": "left_image",
+                "source_topic": "/gripper/camera_fisheye_l/color/image_raw",
+                "source_trigger_index": 0
+            },
+            2: {
+                "timestamp_ns": "2000000000",
+                "timestamp_sec": "2.000000000",
+                "timestamp_index": 60,
+                "topic_key": "left_image",
+                "source_topic": "/gripper/camera_fisheye_l/color/image_raw",
+                "source_trigger_index": 1
+            }
         }
+    },
+    "event_periods": {
+        "left_image": [
+            {
+                "start_event_order_id": 1,
+                "end_event_order_id": 2,
+                "topic_key": "left_image",
+                "source_topic": "/gripper/camera_fisheye_l/color/image_raw",
+                "start_index": 30,
+                "end_index": 59,
+                "startTimeNs": "1000000000",
+                "endTimeNs": "1966666667"
+            }
+        ]
     }
 }
 ```
 
-- `event_points`：事件节点集合。键为事件节点的顺序编号 `order_id`，使用 int 类型，值为事件节点信息。事件节点必须按 `timestamp_ns` 从小到大排序，`order_id` 与排序结果一一对应。
-- `task_id` / `job_id`：透传请求中的任务标识，方便服务编排层关联上下游结果。
-- 输出文件或存储位置：MVP 阶段不强制定义独立文件格式，由服务编排层将该字典对象作为事件生成阶段结果传递给下游；如需要落盘，可存储为 JSON 文件或任务结果表中的结构化字段。
-- 下游模块消费方式：事件标注模块读取 `event_points`，根据相邻事件节点或业务规则生成待标注的事件片段。若 `event_points` 为空，下游应按无可用事件节点处理。
+- `event_points`：按摄像头 `topic_key` 分组；每组内部按时间排序，`order_id` 从 1 开始。
+- `event_periods`：按同一 `topic_key` 分组的半闭半开区间列表。
+- `topic_key` / `source_topic`：区间所属摄像头的结构化 key 和原始 topic，供后续筛选。
+- `source_trigger_index`：输入 `trigger_points` 中的位置，用于追溯。
+
+空输入返回 `event_points: {}` 和 `event_periods: {}`。某个 topic 只有一个节点时，保留该 topic 的节点，区间列表为空。
 
 ## 架构设计
 
-本模块采用工厂模式加抽象基类的整体架构。
-
 核心抽象：
-- `EventGenerationBase`: 事件检索基类。不同的事件生成策略实现不同生成器实例
 
-第一版实现：
-- `AnomalyGenerator`: 基于异常区间生成事件节点
+- `TriggerFilterBase`：决定候选 trigger 是否成为事件节点。
+- `EventPairingBase`：决定同一 topic 内的节点如何形成区间。
+- `EventGenerationBase`：组织校验、分组、筛选、排序、配对和格式化。
+
+MVP 实现：
+
+- `PassThroughTriggerFilter`：不附加业务筛选条件，接受所有 schema 合法的无标签变化节点。
+- `AdjacentByTopicPairing`：按摄像头 topic 分组，并对组内相邻节点依次配对。
+- `TriggerEventGenerator`：串联上述流程。
 
 ## 接口定义
-以下示例为伪代码，其中 `check_input`代表数据质检模块的输出对象。
 
 ```text
 {
     "basic": {
         "task_id": "TASK-001",
         "job_id": "JOB-001",
-        "check_info": check_input
+        "check_info": check_input,
+        "parser_info": parser_input
     },
-    "params": {
-        "mode": "anomaly",
-        "merge_range": 30
-    }
+    "point_policy": {"mode": "pass_through"},
+    "pairing_policy": {"mode": "adjacent_by_topic"}
 }
 ```
 
-### 字段说明
-#### basic
-- `task_id`：业务任务 ID，由服务入口传入或生成。
-- `job_id`：运行任务 ID，由服务编排层生成。MVP 阶段可为空。
-- `check_info`: 数据质检模块的输出对象
+- `check_info.trigger_points`：DataCheck 输出的无标签变化节点。
+- `parser_info.timestamp_list`：Parser 主时间轴。
+- `point_policy.mode`：MVP 仅支持 `pass_through`。
+- `pairing_policy.mode`：MVP 仅支持 `adjacent_by_topic`。
 
-#### params
-- `mode`: 事件节点生成方式
-- `merge_range`: 进行节点合并时允许的最大帧间隔，单位为帧数。MVP 阶段默认值为 30，表示两个事件节点间隔在 30 帧以内时进行合并。对于 fps=30 的视频，30 帧约等于 1 秒。
+最小持续时间由 DataCheck 的 HSMM `min_duration_sec` 控制，本模块不维护第二套同义长度参数。
 
 ## 功能逻辑
-1. 请求解析，提取`check_info`中的信息
-2. 事件节点生成。提取`check_info`中的"data_anomaly_ranges"和"img_anomaly_ranges"信息，生成事件节点
-3. 事件节点生成完毕后，依次对事件节点进行合并
-4. 格式化输出
 
-### 事件节点的生成规则
-1. 对于数据异常区间"data_anomaly_ranges", 事件节点的判定规则为：
-    - 末端执行器全0速异常区间的起止点
-    - 末端执行器的动作参数出现台阶跳变的异常区间的起止点
-2. 对于图像异常区间"img_anomaly_ranges"，事件节点的判定规则为：
-    - 静止帧区间的起止点
-3. 事件节点合并规则
-    - 如果两个事件节点的帧间隔小于或等于 `merge_range`，则将两个节点合并。合并后保留两者中时间更早的那个节点。
+1. 校验 `trigger_points`、`timestamp_list` 和策略参数。
+2. 校验每个 trigger 的 index 与时间戳是否匹配主时间轴。
+3. 使用 `PassThroughTriggerFilter` 接受合法 trigger。
+4. 按 `topic_key` 分组；每组内部按时间排序，对同 topic、同 index 的重复节点去重。
+5. 在各 topic 内独立分配连续 `order_id`，生成 `event_points`。
+6. 使用 `AdjacentByTopicPairing` 生成分组后的 `event_periods`。
+7. 保留摄像头 topic 和 trigger 来源追溯信息。
+
+## 事件节点规则
+
+1. 节点只代表变化位置，不添加运动阶段标签。
+2. 当前无额外筛选规则，schema 和时间位置合法的 trigger 全部成为事件节点。
+3. 图像质量异常和机器人数据质量异常不直接生成事件节点。
+4. 节点不进行距离合并；同 topic、同 index 的完全重复节点只保留一个。
+5. 不同摄像头 topic 的节点分别编号和输出。
+
+## 事件区间配对规则
+
+1. 先按摄像头 `topic_key` 将节点划分为相互独立的时间序列。
+2. 每个 topic 内，将第 1、2 个节点组成第 1 段，第 2、3 个节点组成第 2 段，以此类推。
+3. 因此某个 topic 有 N 个节点时，固定生成 N−1 个事件区间。
+4. 不允许使用其他 topic 的节点作为当前 topic 区间的起点或终点。
+5. 区间采用半闭半开语义：通常输出到后一个节点的前一帧；若后一个节点位于最后一帧，允许使用最后一帧。
 
 ## 数据 schema
-模块输出为字典对象，包含 `task_id`、`job_id`、`event_points` 三类字段。
-`event_points` 的键值为字典格式，事件节点的顺序编号 `order_id` 是字典的 int 类型键，节点信息为对应的值。MVP 阶段只输出事件节点，不直接生成或输出事件时间段。
 
-示例：
-```
-event_points = {
-    1: {
-        "timestamp_ns": "1000000000",
-        "timestamp_sec": "1.000000000",
-        "timestamp_index": 3,
-        "anomaly_code": 1001,
-        "anomaly_name": "oscillation",
-        "source": "data",
-        "is_merged": true
-    }
-}
-```
+### event_points
 
-字段说明
-- `timestamp_ns`: 节点时间戳，字符串格式，单位纳秒
-- `timestamp_sec`: 节点时间戳，字符串格式，单位秒
-- `timestamp_index`: 节点时间戳在`timestamp_list`中的索引
-- `anomaly_code`: 节点所属的异常类型代码
-- `anomaly_name`: 节点所属的异常类型名称
-- `source`: 节点来源，只可以为"data"（来自数据异常区间）或"image"（来自图像异常区间）
-- `is_merged`: 是否发生过节点合并，true代表该节点为合并后的节点；false代表该节点没有和其他事件节点发生合并
+- 第一层 key：摄像头 `topic_key`。
+- 第二层 key：topic 内从 1 开始的 `order_id`。
+- 节点字段：`timestamp_ns`、`timestamp_sec`、`timestamp_index`、`topic_key`、`source_topic`、`source_trigger_index`、`evidence`。
 
-### 异常类型编码规则
+### event_periods
 
-为避免数据异常和图像异常的 `anomaly_code` 发生混用，`anomaly_code` 采用按来源分段的固定枚举。MVP 阶段建议约定：
-
-- `1000-1999`：数据异常，对应 `source = "data"`。
-- `2000-2999`：图像异常，对应 `source = "image"`。
-
-事件生成模块需要同时校验 `anomaly_code` 和 `source`：当 `source` 与 `anomaly_code` 所属区间不一致时，应按非法输入报错。`anomaly_name` 作为可读名称，需要与 `anomaly_code` 一一对应，不参与跨来源复用。后续新增异常类型时，只在对应来源的编码区间内追加枚举。
+- 第一层 key：摄像头 `topic_key`。
+- 值：该 topic 独立生成的区间列表。
+- 区间字段：`start_event_order_id`、`end_event_order_id`、`topic_key`、`source_topic`、`start_index`、`end_index` 及标准时间字段。
 
 ## 异常处理规则
 
-MVP 阶段默认采用 fail-fast 策略，但允许无异常结果正常返回空集合。
+### 必须报错
 
-### 必须报错的情况
+- 缺少 `basic`、`task_id`、`check_info.trigger_points`、`parser_info.timestamp_list` 或策略配置。
+- trigger 缺少 topic、时间戳或 index。
+- `timestamp_list` 为空或非严格递增，trigger index 越界，或时间戳与 index 不一致。
+- `point_policy.mode` 或 `pairing_policy.mode` 未注册。
 
-事件生成模块不重复校验完整 `timestamp_list`，默认数据质检模块已经完成时间轴和 index 合法性校验；本模块只校验异常区间自身携带的起止时间戳和起止 index 是否完整、单调、可用于节点生成。
+### 可退化处理
 
-- 请求缺少 `basic`、`params`、`check_info` 或 `task_id`。
-- `data_anomaly_ranges` / `img_anomaly_ranges` 字段缺失，或字段值不是列表。
-- 异常区间缺少 `start_timestamp_ns`、`end_timestamp_ns`、`start_timestamp_index`、`end_timestamp_index`、`anomaly_code`、`anomaly_name` 等必要字段。
-- 异常区间的起止时间非法，例如 `start_timestamp_ns > end_timestamp_ns`、起止 index 非法。
-- `source` 与 `anomaly_code` 所属编码区间不一致，或 `anomaly_code` 与 `anomaly_name` 不匹配。
-- `mode` 不在已注册事件生成策略中。MVP 阶段仅要求支持 `anomaly` 模式。
-- `merge_range` 不是非负整数。
-
-### 可以降级处理的情况
-
-- `data_anomaly_ranges` 和 `img_anomaly_ranges` 均为空时，返回空的 `event_points`，不视为异常。
-- 异常区间的 `anomaly_name` 不属于当前生成规则关注的类型时，跳过该区间，并在日志中记录。
-- 多个事件节点落在同一 `timestamp_index` 上时，先去重，再按合并规则处理。
-- 两个事件节点的帧间隔小于或等于 `merge_range` 时，合并为一个节点，保留时间更早的节点，并将 `is_merged` 标记为 `true`。
-
-### 日志要求
-
-- 报错日志需要包含 `task_id`、`job_id`、错误字段名和错误原因。
-- 跳过异常区间或合并事件节点时，需要记录来源 `source`、异常类型 `anomaly_name`、原始起止时间戳和最终保留的事件节点。
+- trigger 为空：返回两个空字典。
+- 同 topic、同 index 的 trigger 重复：去重并保留首个来源。
+- 某 topic 只有一个节点：保留节点，返回该 topic 的空区间列表。
 
 ## MVP 验收标准
 
-1. 能够接收数据质检模块输出对象，并从 `data_anomaly_ranges`、`img_anomaly_ranges` 中携带的起止时间戳和起止 index 生成事件节点。
-2. 能够基于数据异常区间的起止点生成事件节点，MVP 至少覆盖末端执行器全 0 速异常和动作参数台阶跳变异常。
-3. 能够基于图像静止帧异常区间的起止点生成事件节点。
-4. 生成的 `event_points` 按 `timestamp_ns` 升序排列，且每个节点包含 `timestamp_ns`、`timestamp_sec`、`timestamp_index`、`anomaly_code`、`anomaly_name`、`source`、`is_merged` 字段。
-5. 当多个事件节点帧间隔小于或等于 `merge_range` 时，能够合并节点，保留时间更早的节点，并正确设置 `is_merged`。
-6. 当输入中不存在可生成事件节点的异常区间时，能够返回空的 `event_points`。
-7. 当输入字段缺失、时间戳非法、异常区间非法或参数非法时，能够抛出明确错误，不生成不可信结果。
-8. 输出结果能够被后续事件标注模块直接读取，用于生成待标注事件片段；事件生成模块本身不直接输出事件时间段。
-9. 至少包含单元测试或等价验证用例，覆盖正常生成、空异常区间、节点合并、非法输入四类场景。
+1. 能消费 DataCheck 的无标签 `trigger_points`。
+2. 能校验 trigger 与主时间轴的一致性。
+3. 能按摄像头 topic 独立排序、编号和输出节点。
+4. 每个 topic 的 N 个节点严格生成 N−1 个相邻区间。
+5. 不同 topic 的节点不会交叉配对。
+6. 节点与区间均保留 `topic_key` 和 `source_topic`。
+7. 空输入、单节点和非法输入有明确结果或错误。
+8. 单元测试覆盖多 topic 分组、相邻配对、排序去重、空输入和非法输入。
 
 ## 更新记录
 
-- 2026-07-10：明确事件生成模块直接引用数据质检异常区间携带的时间戳和 index，不重复依赖完整 `timestamp_list`。
-- 2026-07-09：补充输出、异常处理规则和 MVP 验收标准，统一事件生成参数命名。
-- 2026-07-09：明确 `event_points` 使用 int 类型 `order_id` 作为键，补充 `merge_range` 帧数语义和异常类型编码规则。
+- 2026-07-13：节点取消“运动开始/恢复稳定”标签；输出按摄像头 topic 分组，每个 topic 内以相邻节点生成 N−1 个区间，禁止跨 topic 配对。
+- 2026-07-13：重构模块边界，改为消费 DataCheck 的 `trigger_points`，并新增 trigger 筛选与区间生成职责。
+- 2026-07-10：明确事件生成模块负责连接检测结果与下游事件标注。
 - 2026-07-07：统一文档格式，补充待设计章节。
