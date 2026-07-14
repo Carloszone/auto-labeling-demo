@@ -16,10 +16,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local MCAP auto-labeling MVP")
     parser.add_argument("--mcap-path", required=True, type=Path)
     parser.add_argument("--robot-config-path", required=True, type=Path)
+    parser.add_argument("--pipeline-config-path", type=Path)
     parser.add_argument("--output-path", type=Path)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--vlm-endpoint", default=None)
-    parser.add_argument("--vlm-model", default="qwen/qwen3.5-9b")
+    parser.add_argument("--vlm-model", default=None)
     parser.add_argument("--system-prompt", default="")
     parser.add_argument("--input-prompt", default="")
     parser.add_argument("--task-id", default="local-run")
@@ -27,11 +28,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _load_pipeline_config(path: Path | None) -> dict[str, object]:
+    """Load optional module overrides supplied by the caller."""
+
+    if path is None:
+        return {}
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        raise ValueError("pipeline config must be a JSON object")
+    return raw
+
+
 def main() -> None:
     """Run the serial pipeline and print the final annotation JSON."""
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     args = parse_args()
+    pipeline_config = _load_pipeline_config(args.pipeline_config_path)
     output_path = args.output_path or args.mcap_path.with_suffix(".annotations.json")
     result = AutoLabelingService().run(
         mcap_path=args.mcap_path,
@@ -46,6 +59,10 @@ def main() -> None:
             "system_prompt": args.system_prompt,
             "input_prompt": args.input_prompt,
         },
+        parser_config=pipeline_config.get("parser_config"),
+        data_check_config=pipeline_config.get("data_check_config"),
+        event_generation_config=pipeline_config.get("event_generation_config"),
+        event_labeling_config=pipeline_config.get("event_labeling_config"),
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

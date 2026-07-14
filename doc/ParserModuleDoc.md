@@ -46,58 +46,7 @@
   "parser": {
     "folder_path": "本地目录或 S3 地址",
     "file_type": "mcap",
-    "topics": {
-      "cameras": [
-        {
-          "name": "wrist_left",
-          "topic": "/camera/wrist_left/image",
-          "role": "image",
-          "parser": "image",
-          "format": "raw",
-          "encoding": "bgr8",
-          "width": 640,
-          "height": 480,
-          "required": true,
-          "missing_policy": "error"
-        }
-      ],
-      "state": [
-        {
-          "name": "left_arm.pose",
-          "topic": "/left_arm/tcp_pose",
-          "role": "state",
-          "parser": "pose7d",
-          "dtype": "float32",
-          "shape": [7],
-          "fields": [
-            "position.x",
-            "position.y",
-            "position.z",
-            "orientation.x",
-            "orientation.y",
-            "orientation.z",
-            "orientation.w"
-          ],
-          "required": true,
-          "missing_policy": "error"
-        }
-      ],
-      "action": [
-        {
-        "name": "right_gripper",
-        "topic": "/gripper/gripper_r/data",
-        "role": "gripper",
-        "parser": "gripper",
-        "dtype": "float32",
-        "fields": ["angle"],
-        "shape": [1],
-        "required": false,
-        "sync_policy": "3",
-        "missing_policy": "zero",
-        "group": "right"
-        }
-      ]
-    }
+    "topics": "xxx.json"
   },
   "align": {
     "main_time_topic": "/camera/wrist_left/image",
@@ -111,6 +60,62 @@
     "include_vector_view": true,
     "include_component_schema": true
   }
+}
+```
+
+### topic内容
+```json
+{
+    "cameras": [
+        {
+            "name": "wrist_left",
+            "topic": "/camera/wrist_left/image",
+            "role": "image",
+            "parser": "image",
+            "format": "raw",
+            "encoding": "bgr8",
+            "width": 640,
+            "height": 480,
+            "required": true,
+            "missing_policy": "error"
+        }
+    ],
+        "state": [
+        {
+            "name": "left_arm.pose",
+            "topic": "/left_arm/tcp_pose",
+            "role": "state",
+            "parser": "pose7d",
+            "dtype": "float32",
+            "shape": [7],
+            "fields": [
+            "position.x",
+            "position.y",
+            "position.z",
+            "orientation.x",
+            "orientation.y",
+            "orientation.z",
+            "orientation.w"
+            ],
+            "required": true,
+            "missing_policy": "error"
+        }
+    ],
+        "action": [
+        {
+        "name": "right_gripper",
+        "topic": "/gripper/gripper_r/data",
+        "role": "gripper",
+        "parser": "gripper",
+        "dtype": "float32",
+        "fields": ["angle"],
+        "shape": [1],
+        "required": false,
+        "sync_policy": "3",
+        "missing_policy": "zero",
+        "group": "right"
+        }
+    ]
 }
 ```
 

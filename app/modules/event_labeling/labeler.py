@@ -245,6 +245,7 @@ class EventLabeler:
                 "description": str(vlm_result["detailed_description"]),
                 "baseline_camera_key": baseline_camera_key,
                 "action_state": action_state,
+                "review_status": "pending",
             }
         )
         return annotation
