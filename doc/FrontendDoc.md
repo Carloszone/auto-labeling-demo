@@ -173,7 +173,8 @@ robot_config=<File>
 
 - `main_time_topic`：`el-select`，选项来自上传 robot config 的 `cameras[].topic`；上传成功后后端也返回可选 camera topics。
 - 整数和浮点数：`el-input-number`，按字段显示范围、步长和单位。
-- Prompt：`el-input type="textarea"`，最多 8000 字符。
+
+VLM User Prompt 不放在配置抽屉中，而是作为顶部操作区的常驻 `el-input type="textarea"` 展示，最多 8000 字符。页面明确提示该文本是每次 VLM 请求的 `input[0].content`，并提供“恢复默认”操作，使用户在启动任务前可以直接看到实际任务描述。
 
 字段和范围以 `BackendDoc.md` 第 10 节为准。`rotation` 不展示，因为当前 Parser 未消费该参数。
 
@@ -226,9 +227,15 @@ POST /api/v1/jobs/{job_id}/run
 - `main_camera_key` 对应视频是唯一播放时钟。
 - 主视频 `timeupdate` 更新 `currentTimeSec` 和时间轴游标。
 - 播放/暂停同时作用于所有可用视频。
-- 每 250 ms 检查非主视频误差；误差大于 0.1 秒时设置其 `currentTime=currentTimeSec`。
+- 主视频使用 `preload=auto`，副视频使用 `preload=metadata`，减少主视角开始播放后短暂缓冲造成的停顿。
+- 用户跳转或开始播放时将所有视频一次性对齐到主时间；正常播放期间不再周期性写入副视频 `currentTime`。周期性强制 seek 会导致浏览器反复发起 HTTP Range 请求，引起画面抖动和取流停滞。
 - 非主视频长度不足或播放结束时保持最后一帧，不阻塞主视频。
+- 播放状态只由主视频的 `playing/pause/waiting/error` 事件驱动；副视频失败、暂停或缓冲不会反向暂停主视频。
+- 使用主视频 `currentTime` 的 100ms 只读刷新更新进度条；该刷新不修改任何视频的播放位置。
+- 视频网格使用固定响应式高度和 `minmax(0, 1fr)` 网格行，禁止视频 intrinsic size 在播放前后改变容器高度。
 - 用户拖动时先暂停所有视频，设置所有视频时间，再按拖动前状态决定是否恢复播放。
+- 点击 Event 卡片或时间轴 Event 区间时，页面直接调用播放器暴露的 `seek(start_sec)`；即使视频 metadata 尚未完成加载，也保存待跳转时间并在 `loadedmetadata` 后再次应用。
+- 待跳转时间在全部可用视频成功设置一次 `currentTime` 后必须立即清空；不得在后续组件重绘或播放时重复应用，否则会形成 Range 请求循环并把视频锁定在跳转点。
 
 ### 11.3 逐帧
 
@@ -255,6 +262,8 @@ POST /api/v1/jobs/{job_id}/run
 - `baseline_camera_key` 使用 Checkbox Group 多选筛选，默认全选。
 - 卡片显示时间、topic、动作摘要、action_state、review_status 和 description。
 - 字段名 `prompt` 在 UI 上显示为“动作摘要”，API 字段保持 `prompt`。
+- 播放时间进入某个可见 event 区间时，该卡片显示播放命中高亮，并自动滚动到右侧列表中央。
+- 用户点击卡片或卡片标题时记录选中状态并显示独立选中高亮；选中高亮不随播放时间离开区间而消失。
 
 ### 13.2 编辑
 
@@ -278,6 +287,12 @@ POST /api/v1/jobs/{job_id}/run
 - 请求期间禁用当前卡片状态按钮。
 - 失败时恢复原状态并显示错误。
 - `rejected` event 仍在列表和时间轴中显示，但默认导出不包含。
+
+### 13.4 数据与图像异常复核
+
+- 右侧复核区使用“Event 复核 / 数据异常复核 / 图像异常复核”三个标签页，默认打开 Event 复核。
+- 两类异常页均支持按唯一 `topics` 字符串筛选，卡片显示起止时间、topic、`anomaly_name` 和 `descs`。
+- 异常卡片支持接受、舍弃和恢复待审；状态仅保存在当前页面内，刷新后重置，暂不调用后端且不改变导出结果。
 
 ## 14. 会话恢复
 
@@ -369,6 +384,7 @@ deleteJob(jobId)
 
 ## 20. 更新记录
 
+- 2026-07-15：复核区改为三标签页；新增数据/图像异常本地复核，Event 卡片增加播放命中自动居中高亮和用户选中高亮。
 - 2026-07-14：技术栈调整为与现有 VLA 前端一致的 Vue 3、TypeScript、Vite、Element Plus、Pinia、Vue Router 和 Axios。
 - 2026-07-14：补完布局、上传、配置、轮询、视频同步、时间轴、复核、会话和 API 映射，作为第一版实施基线。
 - 2026-07-14：确定前后端同机部署并通过 HTTP 向其他主机提供页面；输入改为文件上传。

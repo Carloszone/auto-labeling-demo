@@ -308,37 +308,38 @@ class DataChecker:
         return {index: [item for group in groups for item in group.get(index, [])] for index in indexes}
 
     def _merge_details(self, check_detail: dict[int, list[dict[str, Any]]], timestamps: list[dict[str, str]], source: str, min_frames: int, max_gap: int) -> list[dict[str, Any]]:
-        """Merge same-type frame anomalies across topics using the configured frame gap."""
+        """Merge nearby same-type anomalies only within one source topic."""
 
-        grouped: dict[tuple[int, str], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+        grouped: dict[tuple[int, str, str], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
         namespace = range(1000, 2000) if source == "data" else range(2000, 3000)
         for index, details in check_detail.items():
             for item in details:
                 if int(item["anomaly_code"]) in namespace:
-                    grouped[(int(item["anomaly_code"]), str(item["anomaly_name"]))].append((index, item))
+                    grouped[(
+                        int(item["anomaly_code"]), str(item["anomaly_name"]), str(item["topic"])
+                    )].append((index, item))
         output: list[dict[str, Any]] = []
-        for (code, name), items in grouped.items():
+        for (code, name, topic), items in grouped.items():
             items.sort(key=lambda pair: pair[0])
             current: list[tuple[int, dict[str, Any]]] = []
             for item in items:
                 if current and item[0] - current[-1][0] > max_gap + 1:
-                    self._append_range(output, current, timestamps, code, name, min_frames)
+                    self._append_range(output, current, timestamps, code, name, topic, min_frames)
                     current = []
                 current.append(item)
-            self._append_range(output, current, timestamps, code, name, min_frames)
-        return sorted(output, key=lambda item: (item["start_timestamp_index"], item["anomaly_code"]))
+            self._append_range(output, current, timestamps, code, name, topic, min_frames)
+        return sorted(output, key=lambda item: (item["start_timestamp_index"], item["anomaly_code"], item["topics"]))
 
-    def _append_range(self, output: list[dict[str, Any]], items: list[tuple[int, dict[str, Any]]], timestamps: list[dict[str, str]], code: int, name: str, min_frames: int) -> None:
-        """Append a fused range when its number of distinct anomalous frames is sufficient."""
+    def _append_range(self, output: list[dict[str, Any]], items: list[tuple[int, dict[str, Any]]], timestamps: list[dict[str, str]], code: int, name: str, topic: str, min_frames: int) -> None:
+        """Append one topic-local range when enough distinct frames are anomalous."""
 
         if len({index for index, _item in items}) < min_frames:
             return
         start_index, end_index = items[0][0], items[-1][0]
-        topics = sorted({str(item["topic"]) for _index, item in items})
-        descs: dict[str, list[str]] = {topic: [] for topic in topics}
+        descs: list[str] = []
         for _index, item in items:
-            if item["desc"] not in descs[str(item["topic"])]:
-                descs[str(item["topic"])].append(item["desc"])
+            if item["desc"] not in descs:
+                descs.append(item["desc"])
         output.append({
             "start_timestamp_ns": timestamps[start_index]["timestamp_ns"],
             "start_timestamp_sec": timestamps[start_index]["timestamp_sec"],
@@ -346,7 +347,7 @@ class DataChecker:
             "end_timestamp_ns": timestamps[end_index]["timestamp_ns"],
             "end_timestamp_sec": timestamps[end_index]["timestamp_sec"],
             "end_timestamp_index": end_index,
-            "anomaly_code": code, "anomaly_name": name, "topics": topics, "descs": descs,
+            "anomaly_code": code, "anomaly_name": name, "topics": topic, "descs": descs,
         })
 
     def _seconds_to_frames(self, seconds: Any, fps: float, allow_zero: bool = False) -> int:

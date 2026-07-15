@@ -68,6 +68,8 @@ FastAPI :8000
 
 环境变量：
 
+本地开发和演示部署默认从项目根目录 `.env` 加载配置；操作系统、systemd 或容器已经注入的同名环境变量优先于 `.env`。真实 `.env` 不提交到 Git，仓库只提供 `.env.example`。可通过 `AUTO_LABEL_ENV_FILE` 指定其他配置文件。未来数据库密码和 S3 密钥也遵循该规则，但当前 MVP 不读取或依赖这些配置。
+
 | 变量 | 默认值 | 用途 |
 |---|---|---|
 | `AUTO_LABEL_HOST` | `0.0.0.0` | HTTP 监听地址 |
@@ -77,6 +79,11 @@ FastAPI :8000
 | `AUTO_LABEL_WORKER_ID` | `1` | 雪花 ID worker ID，范围 0–1023 |
 | `AUTO_LABEL_VLM_ENDPOINT` | 无默认值 | VLM HTTP 地址 |
 | `AUTO_LABEL_VLM_TIMEOUT_SEC` | `120` | 单次 VLM 请求超时 |
+| `AUTO_LABEL_ENV_FILE` | `<项目根目录>/.env` | 可选的环境变量文件路径 |
+| `AUTO_LABEL_LOG_PATH` | `logs/auto-labeling-demo.log` | 后端日志文件 |
+| `AUTO_LABEL_LOG_LEVEL` | `INFO` | 日志等级 |
+| `AUTO_LABEL_LOG_MAX_BYTES` | `20971520` | 单个日志文件最大 20 MiB |
+| `AUTO_LABEL_LOG_BACKUP_COUNT` | `5` | 轮转日志保留数量 |
 
 ## 4. 服务模块
 
@@ -132,6 +139,8 @@ CurrentJob
 ├── created_at: ISO-8601 string
 └── updated_at: ISO-8601 string
 ```
+
+`AnomalyRangeView.topics` 为单一 topic 字符串，`descs` 为字符串列表。DataCheck 当前只在同 topic、同异常类型内执行区间合并，禁止跨 topic 融合。异常复核状态属于前端临时展示状态，不通过后端保存，也不影响导出。
 
 - `DemoJobService` 使用 `threading.RLock` 保护状态读写。
 - API 返回状态前复制快照，不把可变对象直接暴露给响应序列化。
@@ -361,7 +370,15 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 | 502 | `VLM_UNAVAILABLE` | VLM 请求或响应失败 |
 | 507 | `INSUFFICIENT_STORAGE` | 临时磁盘空间不足 |
 
-日志必须包含：`request_id`、`job_id`、`stage`、`camera_key`（适用时）、异常类型和堆栈。对外错误不返回服务器绝对路径、VLM 凭证或完整堆栈。
+日志同时输出到终端和 `AUTO_LABEL_LOG_PATH`，采用 20 MiB、5 个备份文件的轮转策略。必须包含：
+
+- HTTP 请求的 `request_id`、method、path、status 和耗时。
+- Pipeline 输入配置和实际 User Prompt。
+- Parser、视频生成、DataCheck、EventGeneration、EventLabeling、结果保存及完整 Pipeline 的独立耗时。
+- Parser 输出帧数/时长，DataCheck anomaly 与 trigger 摘要，EventGeneration 区间，VLM 帧角色/顺序、System Prompt、User Prompt 和解析后的输出。
+- `job_id`、`camera_key`（适用时）、异常类型和堆栈。
+
+图片 Base64 不写入日志，避免文件急剧膨胀。对外错误不返回服务器绝对路径、VLM 凭证或完整堆栈。
 
 ## 12. API 接口
 
@@ -658,6 +675,7 @@ AnomalyRangeView 统一为：
 
 ## 16. 更新记录
 
+- 2026-07-15：异常区间接口的 `topics` 调整为单一字符串；明确后端不保存数据/图像异常的临时复核状态，导出逻辑保持不变。
 - 2026-07-14：补完可运行 Demo 技术选型、状态机、进度、视频、文件、错误和完整 HTTP API 规范，作为第一版实施基线。
 - 2026-07-14：确定前后端同机部署、其他主机通过 HTTP 访问；输入改为文件上传到本地临时目录，EventLabeler 输出增加 `review_status=pending`。
 - 2026-07-14：调整为单 MCAP 轻量 Demo，移除数据库、S3、批次和多工作项设计。

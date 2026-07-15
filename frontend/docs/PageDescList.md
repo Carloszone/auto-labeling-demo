@@ -70,9 +70,11 @@ robot config 与 MCAP 在同一个 `multipart/form-data` 请求中上传。
 ### 3.3 VLM 输入 Prompt
 
 - 页面提供文本输入框。
+- 输入框常驻显示在顶部操作区，而不是隐藏在参数弹窗中；标签明确说明它对应每次 VLM 请求的 `input[0].content`。
 - 默认值来自 `tests/example_prompt.json` 的 `user_prompt`。
 - 用户未填写时使用默认值。
 - VLM 输入 Prompt 与 event 中的动作摘要 `prompt` 是两个不同字段。
+- 页面提供只读展开项展示当前固定的 System Prompt，便于核对 context/event 角色约束。
 
 默认示例：
 
@@ -149,6 +151,7 @@ robot config 与 MCAP 在同一个 `multipart/form-data` 请求中上传。
 - 支持拖动共享进度条定位时间。
 - 支持逐帧前进和后退，按 30 FPS 计算，每次移动约 `1/30` 秒。
 - 点击 event 卡片时，所有视频跳转到该 event 起始时间。
+- 如果视频 metadata 尚未加载完成，页面先保存待跳转时间，并在 `loadedmetadata` 后再次应用。
 - 视频仅按正常速度播放，不提供变速、全屏和单视角放大。
 - 多摄像头时长不一致时，以 `main_time_topic` 对应视频为主时间轴。
 
@@ -163,6 +166,8 @@ robot config 与 MCAP 在同一个 `multipart/form-data` 请求中上传。
 - 所有轨道共享播放时间游标。
 - 当前不提供时间轴缩放和滚动。
 - 标注区间颜色透明度为 40%，重叠区域通过颜色叠加加深。
+- Event 复核区的 camera 筛选与二级 Event 轨道联动；选择一个或多个 `baseline_camera_key` 后，轨道只显示这些 camera 的 Event，避免不同来源区间重叠干扰判断。
+- 播放游标与所有区间都基于扣除左侧轨道名称后的同一个内容宽度计算，保证相同秒数落在相同横坐标。
 
 颜色规范：pending 黄色、accepted 绿色、rejected 淡红色、数据异常紫色、图像异常青色，透明度统一为 40%；播放游标使用蓝色。
 
@@ -208,6 +213,8 @@ robot config 与 MCAP 在同一个 `multipart/form-data` 请求中上传。
 - 点击 event 后跳转到起始时间。
 
 ### 5.3 Event 复核
+
+右侧区域以标签页呈现 Event、数据异常和图像异常复核。Event 播放命中时自动高亮并将卡片滚动到列表中央，用户点击的卡片保留选中高亮。两类异常页按单一 topic 筛选，展示起止时间、`anomaly_name`、`descs`，接受/舍弃/恢复待审状态仅在页面内生效，不参与导出。
 
 - 按 `baseline_camera_key` 多选筛选 event。
 - 编辑 event 起止时间、动作摘要、`description` 和 `action_state`。

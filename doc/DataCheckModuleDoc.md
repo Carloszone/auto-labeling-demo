@@ -353,11 +353,8 @@ data_anomaly_ranges = [
         "end_timestamp_index": 10,
         "anomaly_code": 1003,
         "anomaly_name": "oscillation",
-        "topics": ["left_arm_state", "right_arm_state"],
-        "descs": {
-            "left_arm_state": ["检测发现速度(left_arm_state)存在振荡"],
-            "right_arm_state": ["检测发现速度(right_arm_state)存在振荡"]
-        }
+        "topics": "left_arm_state",
+        "descs": ["检测发现速度(left_arm_state)存在振荡"]
     },
     ...
 ]
@@ -372,10 +369,8 @@ img_anomaly_ranges = [
         "end_timestamp_index": 10,
         "anomaly_code": 2003,
         "anomaly_name": "corrupted",
-        "topics": ["right_image"],
-        "descs": {
-            "right_image": ["检测发现图像(right_image)存在损坏帧"]
-        }
+        "topics": "right_image",
+        "descs": ["检测发现图像(right_image)存在损坏帧"]
     },
     ...
 ]
@@ -384,8 +379,8 @@ img_anomaly_ranges = [
 字段说明：
 - `anomaly_code`: 异常类型代码
 - `anomaly_name`: 异常类型名称
-- `topics`: 发生该类异常的 topic 名称列表。融合后的异常片段可能来自多个 topic，因此使用列表承载。
-- `descs`: 异常描述字典。键为 topic 名称，值为该 topic 对应的异常描述列表，格式为 f"检测发现{数据类型}({topic名称}){异常类型名称}"。
+- `topics`: 发生该类异常的唯一 topic 名称，字符串格式。当前暂时禁用跨 topic 合并。
+- `descs`: 当前 topic 的去重异常描述列表。
 - `start_timestamp_ns`: 异常区间的起点时间戳，字符串格式，单位纳秒
 - `start_timestamp_sec`: 异常区间的起点时间戳，字符串格式，单位秒
 - `start_timestamp_index`: 异常区间的起点时间戳在`timestamp_list`中的索引
@@ -484,12 +479,12 @@ MVP 阶段默认采用 fail-fast 策略。
 4. 极值检测能基于 `degree`、`expansion_coef`、`min_tor` 生成正常区间，并输出超限异常结果。
 5. `EndEffectorDetector` 能从 `role = "end_effector"` 的 topic 检测状态变化 trigger，并输出独立的 `trigger_points`。
 6. 在启用图像检测时，模块能输出黑帧、模糊帧、损坏帧和静止帧检测结果。
-7. 数据融合能按 `min_low_quality_time_sec` 过滤短异常片段，并按 `max_gap_time_sec` 合并同类相邻异常区间。
+7. 数据融合能按 `min_low_quality_time_sec` 过滤短异常片段，并按 `max_gap_time_sec` 合并同 topic、同类型的相邻异常区间；不同 topic 始终独立输出。
 8. 正常输入且没有异常或 trigger 时，模块输出空的 `data_anomaly_ranges`、`img_anomaly_ranges` 和 `trigger_points`，并保持 `check_list` 全 0。
 9. `check_list` 长度始终等于 `timestamp_list` 长度。
 10. `check_detail` 中的异常 index 能映射到 `timestamp_list` 中的时间戳。
 11. `data_anomaly_ranges` 和 `img_anomaly_ranges` 中的起止 index、起止时间戳单调合法。
-12. 融合后的 `data_anomaly_ranges` 和 `img_anomaly_ranges` 必须包含 `topics` 和 `descs`，用于保留多 topic 异常来源和描述。
+12. 融合后的 `data_anomaly_ranges` 和 `img_anomaly_ranges` 必须包含字符串 `topics` 和列表 `descs`，且每个异常区间只能关联一个 topic。
 13. 缺少 `parser_info`、`timestamp_list` 为空、列表长度不一致、必需 schema key 缺失时，模块直接失败并返回明确错误。
 14. 非必需 topic 无法检测、滑动窗口帧数不足、单帧图像无法解码等可退化场景不会中断整个任务，并会记录 warning。
 15. 当 `data_detection` 或 `image_detection` 关闭时，对应检测结果为空，但模块仍能输出合法结构。
@@ -498,6 +493,7 @@ MVP 阶段默认采用 fail-fast 策略。
 
 ## 更新记录
 
+- 2026-07-15：暂时禁用异常区间的跨 topic 合并；仅合并同 topic、同类型异常，`topics` 改为只含一个 topic 的字符串，`descs` 改为该 topic 的描述列表。
 - 2026-07-13：时间配置统一使用秒并以 `_sec` 命名，内部固定按 30 FPS 换算；仍按帧执行的平滑窗口和搜索步长改为带 `frame` 的字段名。
 - 2026-07-13：变化节点取消“运动开始/恢复稳定”标签；节点按摄像头 topic 独立输出，并在 evidence 中保留末端执行器检测来源。
 - 2026-07-13：末端执行器 trigger 检测改为 `clinear + 三状态 HSMM`；输入先对齐到主图像帧时间轴，`min_duration_sec` 统一约束候选分段与状态最短持续时间。

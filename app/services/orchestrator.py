@@ -8,25 +8,19 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import build_run_config, load_robot_config
+from app.core.defaults import (
+    DATA_CHECK_DEFAULTS,
+    DEFAULT_INPUT_PROMPT,
+    DEFAULT_SYSTEM_PROMPT,
+    EVENT_GENERATION_DEFAULTS,
+    EVENT_LABELING_DEFAULTS,
+    PARSER_DEFAULTS,
+)
 from app.modules.data_check.checker import DataChecker
 from app.modules.event_generation.anomaly_generator import AnomalyGenerator
 from app.modules.event_labeling.labeler import EventLabeler
 from app.modules.parser.mcap_parser import McapParser
 from app.services.vlm_client import HttpVlmClient
-
-DEFAULT_SYSTEM_PROMPT = """You are a robotics manipulation annotation expert.
-Analyze the ordered frames from one camera viewpoint from the robot perspective.
-Frames marked context_before/context_after provide context; describe the action in event frames.
-Return only a JSON object with exactly these fields:
-{"action_summary": "concise action", "action_state": 1, "detailed_description": "detailed scene and interaction"}
-action_state must be 1 for success, -1 for failure, or 0 when the segment is incomplete or uncertain.
-Describe only observable robot, end-effector, object, spatial, and outcome details."""
-
-DEFAULT_INPUT_PROMPT = (
-    "Analyze this robot manipulation segment. Summarize the action, determine whether it "
-    "succeeds, and describe object positions, state changes, and end-effector interactions."
-)
-
 
 class AutoLabelingService:
     """Run Parser, DataCheck, EventGeneration, and EventLabeling in order."""
@@ -70,10 +64,7 @@ class AutoLabelingService:
         )
         check_request_config = self._data_check_config(data_check_config)
         generation_request_config = _deep_merge(
-            {
-                "point_policy": {"mode": "pass_through"},
-                "pairing_policy": {"mode": "adjacent_by_topic"},
-            },
+            EVENT_GENERATION_DEFAULTS,
             event_generation_config,
         )
         generation_request_config.pop("basic", None)
@@ -126,10 +117,7 @@ class AutoLabelingService:
         """Build a Parser request while protecting runtime-owned input fields."""
 
         request = _deep_merge(
-            {
-                "insert": {"rotation": "ZYX", "max_tor_time_sec": 0.2},
-                "output_format": {"include_vector_view": True, "include_component_schema": True},
-            },
+            PARSER_DEFAULTS,
             overrides,
         )
         request["basic"] = {"task_id": task_id, "job_id": job_id}
@@ -145,41 +133,7 @@ class AutoLabelingService:
     def _data_check_config(self, overrides: dict[str, Any] | None) -> dict[str, Any]:
         """Return default DataCheck settings merged with caller-provided values."""
 
-        return _deep_merge({
-            "basic": {
-                "eps": 1e-9,
-                "fps": 30,
-                "smooth": {"method": "savgol", "window_frame_length": 10, "polyorder": 3},
-            },
-            "data_detection": {
-                "sudden_change_config": {
-                    "enable": True,
-                    "window_time_sec": 0.5,
-                    "z_score": 3,
-                    "sudden_time_sec": 0.066666667,
-                    "step_time_sec": 0.5,
-                    "zcr_ratio": 0.4,
-                },
-                "extreme_value_config": {"enable": True, "degree": 0.01, "expansion_coef": 0.2, "min_tor": 1e-4},
-            },
-            "image_detection": {"enable": True, "luminance": 10, "window_time_sec": 1.0, "lap_var": 150, "z_score": 2, "resize_length": 860, "resize_width": 640, "SSIM": 0.7, "pixel_mae": 5, "moving_area_ratio": 0.05},
-            "trigger_detection": {
-                "mode": "end_effector",
-                "params": {
-                    "algorithm": "Pelt",
-                    "model": "clinear",
-                    "pen": 15,
-                    "min_duration_sec": 0.666666667,
-                    "jump_frames": 1,
-                    "state_count": 3,
-                    "feature_window_sec": 0.166666667,
-                    "stay_probability": 0.995,
-                    "candidate_sigma_sec": 1.333333333,
-                    "candidate_bonus": 1,
-                },
-            },
-            "merge_policy": {"min_low_quality_time_sec": 0.166666667, "max_gap_time_sec": 0.2},
-        }, overrides)
+        return _deep_merge(DATA_CHECK_DEFAULTS, overrides)
 
     def _event_labeling_config(
         self,
@@ -189,22 +143,7 @@ class AutoLabelingService:
         """Merge EventLabeling settings and preserve the existing vlm_params argument."""
 
         config = _deep_merge(
-            {
-                "sampling": {
-                    "mode": "fixed_sequence",
-                    "params": {"fixed_frame_len": 20, "context_frame_len": 2},
-                },
-                "vlm_params": {
-                    "model": "qwen/qwen3.5-9b",
-                    "system_prompt": DEFAULT_SYSTEM_PROMPT,
-                    "input_prompt": DEFAULT_INPUT_PROMPT,
-                },
-                "output": {
-                    "layerId": "l2",
-                    "category": "detail",
-                    "attributes": {"scene": "tabletop", "sceneTags": []},
-                },
-            },
+            EVENT_LABELING_DEFAULTS,
             overrides,
         )
         non_empty_legacy_vlm = {

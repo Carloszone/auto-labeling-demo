@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 import urllib.request
 from typing import Any
 
 from json_repair import repair_json
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class HttpVlmClient:
@@ -32,8 +37,24 @@ class HttpVlmClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
-            raw_response = response.read().decode("utf-8")
+        started = time.perf_counter()
+        LOGGER.info(
+            "vlm_http_request endpoint=%s model=%s image_count=%s timeout_sec=%s",
+            self.endpoint, model, sum(len(items) for items in samples.values()), self.timeout_sec,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
+                raw_response = response.read().decode("utf-8")
+        except Exception:
+            LOGGER.exception(
+                "vlm_http_failed endpoint=%s model=%s duration_sec=%.6f",
+                self.endpoint, model, time.perf_counter() - started,
+            )
+            raise
+        LOGGER.info(
+            "vlm_http_response endpoint=%s model=%s duration_sec=%.6f raw_response=%r",
+            self.endpoint, model, time.perf_counter() - started, raw_response[:20000],
+        )
         return self._parse_response(raw_response)
 
     def _build_input(self, input_prompt: str, samples: dict[str, list[dict[str, Any]]]) -> list[dict[str, str]]:

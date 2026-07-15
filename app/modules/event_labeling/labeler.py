@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import time
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 LOGGER = logging.getLogger(__name__)
@@ -22,10 +22,15 @@ class VlmClientProtocol(Protocol):
 class EventLabeler:
     """Consume event periods, sample images, call VLM, and format annotations."""
 
-    def __init__(self, vlm_client: VlmClientProtocol) -> None:
+    def __init__(
+        self,
+        vlm_client: VlmClientProtocol,
+        progress_callback: Callable[[int, int], None] | None = None,
+    ) -> None:
         """Store the injected VLM client so tests can avoid network calls."""
 
         self._vlm_client = vlm_client
+        self._progress_callback = progress_callback
         self._last_segment_id = 0
 
     def label(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +42,7 @@ class EventLabeler:
         if not isinstance(basic, dict) or not isinstance(sampling, dict) or not isinstance(vlm_params, dict):
             raise ValueError("request must include basic, sampling, and vlm_params")
         task_id = basic.get("task_id")
+        job_id = basic.get("job_id")
         if not task_id:
             raise ValueError("basic.task_id is required")
         parser_info = basic.get("parser_info")
@@ -66,7 +72,7 @@ class EventLabeler:
         # Step 1: validate event periods generated upstream.
         # Step 2: sample each period from parser image frames.
         # Step 3: call VLM for each sampled period and map the response to annotation JSON.
-        for period in periods:
+        for completed, period in enumerate(periods, start=1):
             topic_key = str(period.get("topic_key", ""))
             if not topic_key:
                 raise ValueError("event period topic_key is required")
@@ -80,11 +86,21 @@ class EventLabeler:
                 topic_key,
             )
             topic_samples = samples[topic_key]
+            sample_manifest = [
+                {
+                    "frame_index": item["frame_index"],
+                    "sample_role": item["sample_role"],
+                    "timestamp_ns": item["timestamp_ns"],
+                    "timestamp_sec": item["timestamp_sec"],
+                }
+                for item in topic_samples
+            ]
             LOGGER.info(
-                "VLM sampling task_id=%s topic_key=%s start_index=%s end_index=%s "
+                "VLM sampling task_id=%s job_id=%s topic_key=%s start_index=%s end_index=%s "
                 "event_source_frames=%s event_sample_frames=%s context_before_frames=%s "
                 "context_after_frames=%s max_event_frames=%s",
                 task_id,
+                job_id,
                 topic_key,
                 period["start_index"],
                 period["end_index"],
@@ -94,11 +110,31 @@ class EventLabeler:
                 sum(item["sample_role"] == "context_after" for item in topic_samples),
                 MAX_EVENT_FRAME_LEN,
             )
-            vlm_result = self._vlm_client.label(
-                model=str(vlm_params["model"]),
-                system_prompt=str(vlm_params.get("system_prompt", "")),
-                input_prompt=str(vlm_params.get("input_prompt", "")),
-                samples=samples,
+            LOGGER.info(
+                "vlm_input task_id=%s job_id=%s topic_key=%s start_index=%s end_index=%s model=%s system_prompt=%r input_prompt=%r sample_manifest=%s",
+                task_id, job_id, topic_key, period["start_index"], period["end_index"],
+                vlm_params["model"], vlm_params.get("system_prompt", ""),
+                vlm_params.get("input_prompt", ""), sample_manifest,
+            )
+            vlm_started = time.perf_counter()
+            try:
+                vlm_result = self._vlm_client.label(
+                    model=str(vlm_params["model"]),
+                    system_prompt=str(vlm_params.get("system_prompt", "")),
+                    input_prompt=str(vlm_params.get("input_prompt", "")),
+                    samples=samples,
+                )
+            except Exception:
+                LOGGER.exception(
+                    "vlm_call_failed task_id=%s job_id=%s topic_key=%s start_index=%s end_index=%s duration_sec=%.6f",
+                    task_id, job_id, topic_key, period["start_index"], period["end_index"],
+                    time.perf_counter() - vlm_started,
+                )
+                raise
+            LOGGER.info(
+                "vlm_output task_id=%s job_id=%s topic_key=%s start_index=%s end_index=%s duration_sec=%.6f result=%s",
+                task_id, job_id, topic_key, period["start_index"], period["end_index"],
+                time.perf_counter() - vlm_started, vlm_result,
             )
             response.append(
                 self._format_annotation(
@@ -109,6 +145,8 @@ class EventLabeler:
                     topic_key,
                 )
             )
+            if self._progress_callback is not None:
+                self._progress_callback(completed, len(periods))
 
         return {"task_id": task_id, "job_id": basic.get("job_id"), "response": response}
 
@@ -176,6 +214,9 @@ class EventLabeler:
             + [(index, "event") for index in event]
             + [(index, "context_after") for index in after]
         )
+        ordered_indexes = [index for index, _role in indexed_roles]
+        if ordered_indexes != sorted(ordered_indexes) or len(ordered_indexes) != len(set(ordered_indexes)):
+            raise ValueError("sample images must be unique and ordered chronologically")
         samples: dict[str, list[dict[str, Any]]] = {}
         for frame_index, sample_role in indexed_roles:
             image = image_list[frame_index].get(topic_key)
