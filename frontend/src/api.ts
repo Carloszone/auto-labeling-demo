@@ -13,6 +13,8 @@ export interface ApiConfig {
 export interface JobSummary {
   job_id: string
   file_name: string
+  file_names: string[]
+  mcap_count: number
   file_size_bytes: number
   status: 'validating' | 'ready_to_run' | 'running' | 'ready' | 'failed'
   stage: string
@@ -30,7 +32,9 @@ export interface JobSummary {
   error: { code: string; message: string } | null
   available_camera_topics: Array<{ camera_key: string; source_topic: string }>
   main_time_topic: string | null
+  segment_manifest: Array<Record<string, any>>
   created_at: string
+  completed_at: string | null
   updated_at: string
 }
 
@@ -78,6 +82,7 @@ export interface JobResult {
 
 export interface RunRequest {
   input_prompt: string
+  system_prompt: string
   robot_config_overrides: Record<string, any>
   parser_config: Record<string, any>
   data_check_config: Record<string, any>
@@ -101,15 +106,16 @@ export function apiError(error: unknown): string {
 export const api = {
   getConfig: (signal?: AbortSignal) => http.get<ApiConfig>('/config', { signal }).then(r => r.data),
   getCurrentJob: (signal?: AbortSignal) => http.get<JobSummary>('/jobs/current', { signal }).then(r => r.data),
+  getJobHistory: (signal?: AbortSignal) => http.get<JobSummary[]>('/jobs/history', { signal }).then(r => r.data),
   getJob: (jobId: string, signal?: AbortSignal) => http.get<JobSummary>(`/jobs/${jobId}`, { signal }).then(r => r.data),
   createJob: (
-    mcap: File,
+    mcaps: File[],
     robotConfig: File,
     onProgress: (value: number) => void,
     signal?: AbortSignal,
   ) => {
     const form = new FormData()
-    form.append('mcap', mcap)
+    for (const mcap of mcaps) form.append('mcaps', mcap)
     form.append('robot_config', robotConfig)
     return http.post<JobSummary>('/jobs', form, {
       signal,

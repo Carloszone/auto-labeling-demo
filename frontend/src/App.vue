@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ElMessage, ElMessageBox, type UploadFile, type UploadFiles } from 'element-plus'
+import { ElMessage, ElMessageBox, type UploadFile, type UploadFiles, type UploadRawFile } from 'element-plus'
 import { useJobStore } from './stores/job'
 import { api, apiError, type EventPatch, type ReviewStatus, type RunRequest } from './api'
 import MultiCameraPlayer from './components/MultiCameraPlayer.vue'
@@ -8,10 +8,11 @@ import AnnotationTimeline from './components/AnnotationTimeline.vue'
 import EventReviewPanel from './components/EventReviewPanel.vue'
 
 const store = useJobStore()
-const mcapFile = ref<File | null>(null)
+const mcapFiles = ref<File[]>([])
 const robotFile = ref<File | null>(null)
 const configOpen = ref(false)
 const inputPrompt = ref('')
+const systemPrompt = ref('')
 const currentTime = ref(0)
 const reviewPanel = ref<{ hasUnsavedChanges: () => boolean } | null>(null)
 const player = ref<{ seek: (time: number) => void } | null>(null)
@@ -27,23 +28,27 @@ const settings = reactive({
 })
 let appliedSettings = { ...settings }
 
-const canUpload = computed(() => Boolean(mcapFile.value && robotFile.value && !store.uploading && store.job?.status !== 'running'))
-const canRun = computed(() => Boolean(store.job && ['ready_to_run', 'ready', 'failed'].includes(store.job.status)))
+const canUpload = computed(() => Boolean(mcapFiles.value.length && robotFile.value && !store.uploading && store.job?.status !== 'running'))
+const canRun = computed(() => Boolean(store.job && store.job.job_id === store.currentJobId && ['ready_to_run', 'ready', 'failed'].includes(store.job.status)))
 const duration = computed(() => store.result.duration_sec || store.job?.duration_sec || 0)
-const systemPrompt = computed(() => store.config?.pipeline_defaults?.event_labeling_config?.vlm_params?.system_prompt || '')
 const timelineEvents = computed(() => store.result.events.filter(event =>
   !selectedEventTopics.value.length || selectedEventTopics.value.includes(event.baseline_camera_key),
 ))
 
-function selectFile(kind: 'mcap' | 'robot', uploadFile: UploadFile, _files: UploadFiles) {
+function selectFile(kind: 'mcap' | 'robot', uploadFile: UploadFile, files: UploadFiles) {
   if (!uploadFile.raw) return
   if (kind === 'mcap') {
-    const max = store.config?.max_upload_bytes || 5 * 1024 ** 3
-    if (uploadFile.raw.size > max) {
-      ElMessage.error('MCAP 超过 5 GiB')
+    const max = store.config?.max_upload_bytes || 50 * 1024 ** 3
+    const selected = files.map(item => item.raw).filter((item): item is UploadRawFile => Boolean(item))
+    if (selected.length > 32) {
+      ElMessage.error('MCAP 文件数量超过限制')
       return
     }
-    mcapFile.value = uploadFile.raw
+    if (selected.reduce((sum, item) => sum + item.size, 0) > max) {
+      ElMessage.error(`MCAP 文件总大小超过 ${(max / 1024 ** 3).toFixed(0)} GiB`)
+      return
+    }
+    mcapFiles.value = selected
   } else {
     if (uploadFile.raw.size > 2 * 1024 ** 2) {
       ElMessage.error('Robot Config 超过 2 MiB')
@@ -53,13 +58,16 @@ function selectFile(kind: 'mcap' | 'robot', uploadFile: UploadFile, _files: Uplo
   }
 }
 function onMcapChange(file: UploadFile, files: UploadFiles) { selectFile('mcap', file, files) }
+function onMcapRemove(_file: UploadFile, files: UploadFiles) {
+  mcapFiles.value = files.map(item => item.raw).filter((item): item is UploadRawFile => Boolean(item))
+}
 function onRobotChange(file: UploadFile, files: UploadFiles) { selectFile('robot', file, files) }
 async function upload() {
-  if (!mcapFile.value || !robotFile.value) return
+  if (!mcapFiles.value.length || !robotFile.value) return
   if (reviewPanel.value?.hasUnsavedChanges() && !await ElMessageBox.confirm('存在未保存的 Event 编辑，创建新工作项会丢失这些修改，是否继续？', '未保存修改', { type: 'warning' }).catch(() => false)) return
   if (store.job && !await ElMessageBox.confirm('创建新工作项会清理当前结果，是否继续？', '确认上传', { type: 'warning' }).catch(() => false)) return
   try {
-    await store.createJob(mcapFile.value, robotFile.value)
+    await store.createJob(mcapFiles.value, robotFile.value)
     selectedEventTopics.value = []
     inputPrompt.value ||= store.config?.default_input_prompt || ''
     settings.main_time_topic = store.job?.main_time_topic || ''
@@ -70,6 +78,7 @@ async function upload() {
 function runRequest(): RunRequest {
   return {
     input_prompt: inputPrompt.value,
+    system_prompt: systemPrompt.value,
     robot_config_overrides: { main_time_topic: settings.main_time_topic },
     parser_config: { insert: { max_tor_time_sec: settings.max_tor_time_sec } },
     data_check_config: {
@@ -118,12 +127,19 @@ function seek(time: number) {
   player.value?.seek(time)
 }
 function resetPrompt() { inputPrompt.value = store.config?.default_input_prompt || '' }
+function resetSystemPrompt() {
+  systemPrompt.value = store.config?.pipeline_defaults?.event_labeling_config?.vlm_params?.system_prompt || ''
+}
 function download() {
   if (!store.job) return
   if (!store.job.accepted_event_count && !window.confirm('当前没有 accepted event，仍然导出空结果吗？')) return
   window.location.href = api.exportUrl(store.job.job_id)
 }
 function onVisibility() { if (store.job?.status === 'running') store.schedulePoll(0) }
+async function selectHistory(jobId: string) {
+  if (!jobId || jobId === store.job?.job_id) return
+  try { await store.selectJob(jobId) } catch (error) { ElMessage.error(apiError(error)) }
+}
 
 function loadDefaults() {
   const defaults = store.config?.pipeline_defaults
@@ -172,6 +188,7 @@ onMounted(async () => {
   await store.initialize()
   loadDefaults()
   inputPrompt.value = store.config?.default_input_prompt || ''
+  resetSystemPrompt()
   settings.main_time_topic = store.job?.main_time_topic || ''
   appliedSettings = { ...settings }
   document.addEventListener('visibilitychange', onVisibility)
@@ -184,8 +201,8 @@ onBeforeUnmount(() => { store.stopPolling(); document.removeEventListener('visib
     <el-alert title="内部算法演示 Demo，请勿上传敏感数据" type="warning" :closable="false" show-icon />
     <section class="toolbar panel">
       <div class="upload-row">
-        <el-upload :auto-upload="false" :limit="1" accept=".mcap" :disabled="store.uploading || store.job?.status === 'running'" :show-file-list="true" :on-change="onMcapChange">
-          <el-button>选择 MCAP</el-button>
+        <el-upload :auto-upload="false" :limit="32" multiple accept=".mcap" :disabled="store.uploading || store.job?.status === 'running'" :show-file-list="true" :on-change="onMcapChange" :on-remove="onMcapRemove">
+          <el-button>选择 MCAP（可多选）</el-button>
         </el-upload>
         <el-upload :auto-upload="false" :limit="1" accept=".json" :disabled="store.uploading || store.job?.status === 'running'" :show-file-list="true" :on-change="onRobotChange">
           <el-button>选择 Robot Config</el-button>
@@ -195,6 +212,9 @@ onBeforeUnmount(() => { store.stopPolling(); document.removeEventListener('visib
         <el-button :disabled="!store.job" @click="openConfig">参数配置</el-button>
         <el-button type="success" :disabled="!canRun" @click="run">开始自动标注</el-button>
         <el-button :disabled="store.job?.status !== 'ready'" @click="download">导出 JSON</el-button>
+        <el-select :model-value="store.job?.job_id || ''" placeholder="历史标注 Job ID" style="width: 260px" @change="selectHistory">
+          <el-option v-for="item in store.history" :key="item.job_id" :label="`${item.job_id} · ${item.file_name}`" :value="item.job_id" />
+        </el-select>
       </div>
       <div class="prompt-row">
         <div class="prompt-heading">
@@ -204,16 +224,26 @@ onBeforeUnmount(() => { store.stopPolling(); document.removeEventListener('visib
         </div>
         <el-input v-model="inputPrompt" type="textarea" :rows="3" maxlength="8000" show-word-limit :disabled="store.job?.status === 'running'" />
         <el-collapse class="prompt-details">
-          <el-collapse-item title="查看固定的 VLM System Prompt">
-            <el-input :model-value="systemPrompt" type="textarea" :rows="7" readonly />
+          <el-collapse-item title="编辑 VLM System Prompt">
+            <div class="prompt-heading">
+              <span>留空时由后端使用默认 System Prompt</span>
+              <el-button link type="primary" :disabled="store.job?.status === 'running'" @click="resetSystemPrompt">恢复默认</el-button>
+            </div>
+            <el-input v-model="systemPrompt" type="textarea" :rows="10" maxlength="20000" show-word-limit :disabled="store.job?.status === 'running'" />
           </el-collapse-item>
         </el-collapse>
       </div>
       <el-progress v-if="store.uploading" :percentage="store.uploadProgress" :stroke-width="12" />
       <div v-if="store.job" class="job-status">
-        <strong>{{ store.job.job_id }}</strong><span>{{ store.job.file_name }}</span>
+        <strong>{{ store.job.job_id }}</strong><span>{{ store.job.mcap_count }} 个 MCAP · {{ store.job.file_names?.join('、') || store.job.file_name }}</span>
         <el-tag>{{ store.job.status }}</el-tag><span>{{ store.job.message }}</span>
         <el-progress :percentage="store.job.progress" :status="store.job.status === 'failed' ? 'exception' : store.job.status === 'ready' ? 'success' : undefined" />
+      </div>
+      <div v-if="store.job?.segment_manifest?.length" class="segment-manifest">
+        <strong>按 MCAP 主相机时间戳确定的处理顺序：</strong>
+        <el-tag v-for="(segment, index) in store.job.segment_manifest" :key="segment.source_mcap" type="info">
+          {{ index + 1 }}. {{ segment.source_mcap }} · 接受 {{ segment.accepted_frame_count }} 帧 · 重叠丢弃 {{ segment.overlap_dropped_frame_count }} 帧
+        </el-tag>
       </div>
       <el-alert v-if="store.error" :title="store.error" type="error" show-icon :closable="false" />
       <el-alert v-if="store.job?.error" :title="`${store.job.error.message}（${store.job.error.code}）`" type="error" show-icon :closable="false" />

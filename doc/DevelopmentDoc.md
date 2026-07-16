@@ -299,10 +299,11 @@ PyJWT>=2.13.0
 
 本地开发/测试虚拟环境为 `/home/carlos-ssd/venvs/vla-main`，使用 `source /home/carlos-ssd/venvs/vla-main/bin/activate` 启用虚拟环境。
 
-MVP 阶段默认使用本地文件 `tests/train_data_1.mcap` 作为测试输入，并使用 `tests/train_data_1.json` 作为该 MCAP 对应的机器人/topic 配置；实际运行时必须由服务入口传入本地 MCAP 路径和机器人配置 JSON 路径，不考虑 S3/MinIO 下载、数据库状态记录和前端交互。VLM 调用配置以 `doc/EventLabelingModuleDoc.md` 中的 `vlm_params` 和 VLM 服务调用接口为准；服务入口至少需要能传入或读取 `model`、`system_prompt`、`input_prompt` 和 VLM 服务地址。
+核心算法测试默认使用 `tests/train_data_1.mcap` 和对应机器人/topic 配置；Demo 服务实际运行时可上传 1–32 个属于同一连续任务的 MCAP。文件在本地临时目录处理，不考虑 S3/MinIO 下载或数据库状态记录；后端仅在进程内保存一个当前工作项和最近 5 个成功结果。VLM 调用配置以 `doc/EventLabelingModuleDoc.md` 中的 `vlm_params` 和服务接口为准；服务入口至少需要能传入或读取 `model`、`system_prompt`、`input_prompt`、VLM 地址和超时时间。
 
 ## 更新记录
 
+- 2026-07-15：Demo 支持多 MCAP 时间戳排序、对齐拼接和固定帧率视频；加入最近 5 次成功结果切换，并将单 Event VLM 异常调整为失败标注后继续执行。
 - 2026-07-13：明确 DataCheck 输出 trigger 检测事实、EventGeneration 负责节点筛选与区间配对、EventLabeling 负责采样和 VLM 标注的模块边界。
 - 2026-07-10：新增代码说明与注释规则，要求所有函数/类添加说明，并为脚本流程补充步骤注释。
 - 2026-07-10：根据 MVP 范围澄清，将开发目标收敛为本地 MCAP 输入到最终标注 JSON 输出的核心算法服务。

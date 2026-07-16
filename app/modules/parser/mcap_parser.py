@@ -12,6 +12,7 @@ from mcap.reader import make_reader
 from mcap_ros2.decoder import DecoderFactory
 
 from app.core.config import RobotConfig, TopicConfig
+from app.core.defaults import MULTI_MCAP_POLICY
 
 
 class McapParser:
@@ -23,9 +24,13 @@ class McapParser:
         parser_cfg = request.get("parser", {})
         if parser_cfg.get("file_type") != "mcap":
             raise ValueError("MVP parser only supports mcap file_type")
-        mcap_path = Path(parser_cfg["mcap_path"])
-        if not mcap_path.exists():
-            raise FileNotFoundError(mcap_path)
+        configured_paths = parser_cfg.get("mcap_paths") or [parser_cfg.get("mcap_path")]
+        mcap_paths = [Path(path) for path in configured_paths if path]
+        if not mcap_paths:
+            raise ValueError("at least one MCAP path is required")
+        for mcap_path in mcap_paths:
+            if not mcap_path.exists():
+                raise FileNotFoundError(mcap_path)
         robot_config = parser_cfg["robot_config"]
         if not isinstance(robot_config, RobotConfig):
             raise ValueError("parser.robot_config must be a RobotConfig")
@@ -34,6 +39,16 @@ class McapParser:
         if max_tor_time_sec < 0:
             raise ValueError("insert.max_tor_time_sec must not be negative")
         max_tor_time_ns = int(round(max_tor_time_sec * 1_000_000_000))
+
+        if len(mcap_paths) > 1:
+            return self._parse_multiple(mcap_paths, robot_config, max_frames, max_tor_time_ns)
+        return self._parse_one(mcap_paths[0], robot_config, max_frames, max_tor_time_ns)
+
+    def _parse_one(
+        self, mcap_path: Path, robot_config: RobotConfig, max_frames: int | None,
+        max_tor_time_ns: int,
+    ) -> dict[str, Any]:
+        """Parse one file using its main camera timestamps."""
 
         raw = self._read_topics(mcap_path, robot_config, max_frames=max_frames)
         main_records = raw[robot_config.main_time_topic]
@@ -62,7 +77,7 @@ class McapParser:
             state_list.append(self._aligned_values(raw, robot_config.observation_state, ts, max_tor_time_ns))
             action_list.append(self._aligned_values(raw, robot_config.action, ts, max_tor_time_ns))
 
-        return {
+        result = {
             "timestamp_list": timestamp_list,
             "image_list": image_list,
             "main_time_camera_key": self._main_time_camera_key(robot_config),
@@ -74,6 +89,182 @@ class McapParser:
             "state_schema": state_schema,
             "action_schema": action_schema,
         }
+        result["segment_manifest"] = [{
+            "source_mcap": mcap_path.name,
+            "start_timestamp_ns": timestamp_list[0]["timestamp_ns"],
+            "end_timestamp_ns": timestamp_list[-1]["timestamp_ns"],
+            "source_frame_count": len(timestamp_list),
+        }]
+        return result
+
+    def scan_main_time_range(self, mcap_path: Path, main_time_topic: str) -> dict[str, Any]:
+        """Read only the main topic envelope used to order and validate segments."""
+
+        first: int | None = None
+        last: int | None = None
+        count = 0
+        with mcap_path.open("rb") as stream:
+            reader = make_reader(stream)
+            for _schema, channel, message in reader.iter_messages(topics=[main_time_topic]):
+                timestamp = int(message.log_time)
+                first = timestamp if first is None else min(first, timestamp)
+                last = timestamp if last is None else max(last, timestamp)
+                count += 1
+        if first is None or last is None:
+            raise ValueError(f"main time topic has no messages: {mcap_path.name}")
+        return {
+            "path": mcap_path, "source_mcap": mcap_path.name,
+            "start_timestamp_ns": first, "end_timestamp_ns": last,
+            "source_frame_count": count,
+        }
+
+    def _parse_multiple(
+        self, paths: list[Path], robot_config: RobotConfig, max_frames: int | None,
+        max_tor_time_ns: int,
+    ) -> dict[str, Any]:
+        """Order files by recorded timestamps, resolve boundaries, and build one CFR dataset."""
+
+        policy = MULTI_MCAP_POLICY
+        if len(paths) > int(policy["max_segment_count"]):
+            raise ValueError(f"MCAP segment count exceeds {policy['max_segment_count']}")
+        scanned = [self.scan_main_time_range(path, robot_config.main_time_topic) for path in paths]
+        # Upload order is only a deterministic tie breaker. Recorded main-camera
+        # timestamps are the sole ordering key for different time ranges.
+        upload_index = {path: index for index, path in enumerate(paths)}
+        scanned.sort(key=lambda item: (
+            int(item["start_timestamp_ns"]), int(item["end_timestamp_ns"]),
+            upload_index[item["path"]],
+        ))
+        max_gap_ns = int(round(float(policy["max_video_fill_gap_sec"]) * 1e9))
+        coverage_end = int(scanned[0]["end_timestamp_ns"])
+        previous_name = str(scanned[0]["source_mcap"])
+        for current in scanned[1:]:
+            gap = int(current["start_timestamp_ns"]) - coverage_end
+            if gap >= max_gap_ns:
+                raise ValueError(
+                    f"MCAP gap is too large: {previous_name} -> "
+                    f"{current['source_mcap']}, gap_sec={gap / 1e9:.9f}"
+                )
+            if int(current["end_timestamp_ns"]) > coverage_end:
+                coverage_end = int(current["end_timestamp_ns"])
+                previous_name = str(current["source_mcap"])
+
+        parsed_segments: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for metadata in scanned:
+            parsed_segments.append((
+                metadata,
+                self._parse_one(metadata["path"], robot_config, max_frames, max_tor_time_ns),
+            ))
+        return self._stitch_segments(parsed_segments, policy)
+
+    def _stitch_segments(
+        self, segments: list[tuple[dict[str, Any], dict[str, Any]]], policy: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Create a relative fixed-rate timeline with earlier-segment overlap precedence."""
+
+        fps = int(policy["fps"])
+        frame_period_ns = 1_000_000_000 / fps
+        first_ns = int(segments[0][0]["start_timestamp_ns"])
+        last_ns = max(int(metadata["end_timestamp_ns"]) for metadata, _parsed in segments)
+        frame_count = int(round((last_ns - first_ns) / frame_period_ns)) + 1
+        source_rows: list[tuple[int, int, dict[str, Any], int]] = []
+        manifest: list[dict[str, Any]] = []
+        accepted_until = -1
+        for segment_index, (metadata, parsed) in enumerate(segments):
+            timestamps = [int(item["timestamp_ns"]) for item in parsed["timestamp_list"]]
+            accepted = [index for index, timestamp in enumerate(timestamps) if timestamp > accepted_until]
+            dropped = len(timestamps) - len(accepted)
+            if accepted:
+                accepted_until = max(accepted_until, timestamps[accepted[-1]])
+                for index in accepted:
+                    source_rows.append((timestamps[index], segment_index, parsed, index))
+            manifest.append({
+                **{key: value for key, value in metadata.items() if key != "path"},
+                "accepted_frame_count": len(accepted), "overlap_dropped_frame_count": dropped,
+            })
+        if not source_rows:
+            raise ValueError("no frames remain after resolving MCAP overlap")
+        source_rows.sort(key=lambda item: item[0])
+        source_times = [item[0] for item in source_rows]
+        timestamp_list: list[dict[str, str]] = []
+        image_list: list[dict[str, Any]] = []
+        state_list: list[dict[str, np.ndarray]] = []
+        action_list: list[dict[str, np.ndarray]] = []
+        frame_manifest: list[dict[str, Any]] = []
+        for frame_index in range(frame_count):
+            source_target_ns = first_ns + int(round(frame_index * frame_period_ns))
+            position = bisect_left(source_times, source_target_ns)
+            candidate_positions = [idx for idx in (position - 1, position) if 0 <= idx < len(source_rows)]
+            nearest_position = min(candidate_positions, key=lambda idx: abs(source_times[idx] - source_target_ns))
+            source_ns, segment_index, parsed, source_index = source_rows[nearest_position]
+            relative_ns = int(round(frame_index * 1_000_000_000 / fps))
+            image_filled = abs(source_ns - source_target_ns) > int(round(float(policy["continuous_gap_sec"]) * 1e9))
+            timestamp_list.append(self._timestamp_record(relative_ns))
+            image_list.append({
+                key: {**value, "alignment_filled": image_filled}
+                for key, value in parsed["image_list"][source_index].items()
+            })
+            state_list.append(self._interpolate_aligned_values(source_rows, position, source_target_ns, "state_list", policy))
+            action_list.append(self._interpolate_aligned_values(source_rows, position, source_target_ns, "action_list", policy))
+            frame_manifest.append({
+                "global_frame_index": frame_index, "relative_timestamp_ns": str(relative_ns),
+                "source_timestamp_ns": str(source_ns),
+                "source_mcap": segments[segment_index][0]["source_mcap"],
+                "source_frame_index": source_index,
+                "image_filled": image_filled,
+            })
+        template = segments[0][1]
+        return {
+            "timestamp_list": timestamp_list, "image_list": image_list,
+            "main_time_camera_key": template["main_time_camera_key"],
+            "camera_schema": template["camera_schema"],
+            "state_list": state_list, "action_list": action_list,
+            "state_vector_list": [self._vectorize(row, self._configs_from_schema(template["state_schema"])) for row in state_list],
+            "action_vector_list": [self._vectorize(row, self._configs_from_schema(template["action_schema"])) for row in action_list],
+            "state_schema": template["state_schema"], "action_schema": template["action_schema"],
+            "segment_manifest": manifest, "frame_manifest": frame_manifest,
+        }
+
+    def _interpolate_aligned_values(
+        self, rows: list[tuple[int, int, dict[str, Any], int]], position: int,
+        target_ns: int, list_name: str, policy: dict[str, Any],
+    ) -> dict[str, np.ndarray]:
+        """Use nearby aligned values, otherwise interpolate only across an allowed gap."""
+
+        candidates = [idx for idx in (position - 1, position) if 0 <= idx < len(rows)]
+        nearest_index = min(candidates, key=lambda idx: abs(rows[idx][0] - target_ns))
+        nearest = rows[nearest_index]
+        tolerance_ns = int(round(float(policy["continuous_gap_sec"]) * 1e9))
+        if abs(nearest[0] - target_ns) <= tolerance_ns or position == 0 or position == len(rows):
+            return {key: value.copy() for key, value in nearest[2][list_name][nearest[3]].items()}
+        before, after = rows[position - 1], rows[position]
+        gap_ns = after[0] - before[0]
+        max_gap_ns = int(round(float(policy["max_motion_interpolation_gap_sec"]) * 1e9))
+        if gap_ns > max_gap_ns:
+            raise ValueError(f"motion interpolation gap is too large: {gap_ns / 1e9:.9f}s")
+        ratio = (target_ns - before[0]) / gap_ns
+        left = before[2][list_name][before[3]]
+        right = after[2][list_name][after[3]]
+        schema_name = "state_schema" if list_name == "state_list" else "action_schema"
+        parsers = {str(item["key"]): str(item.get("parser", "")) for item in before[2][schema_name]}
+        output: dict[str, np.ndarray] = {}
+        for key in left:
+            if parsers.get(key) == "pose7d" and left[key].size == 7:
+                position_value = left[key][:3] + (right[key][:3] - left[key][:3]) * ratio
+                quaternion = self._slerp(left[key][3:7], right[key][3:7], ratio)
+                output[key] = np.concatenate([position_value, quaternion]).astype(np.float32)
+            else:
+                output[key] = (left[key] + (right[key] - left[key]) * ratio).astype(np.float32)
+        return output
+
+    def _configs_from_schema(self, schema: list[dict[str, Any]]) -> list[TopicConfig]:
+        """Build the minimal config view needed by the existing vectorizer."""
+
+        return [TopicConfig(
+            name=str(item["key"]), topic=str(item["topic"]), role="",
+            parser=str(item.get("parser", "")), dtype=str(item.get("dtype", "float32")),
+            shape=list(item.get("shape", [])),
+        ) for item in schema]
 
     def _main_time_camera_key(self, robot_config: RobotConfig) -> str:
         """Return the configured camera name whose topic drives the aligned timeline."""

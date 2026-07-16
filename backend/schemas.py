@@ -43,6 +43,7 @@ class RunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input_prompt: str = Field(default="", max_length=8000)
+    system_prompt: str = Field(default="", max_length=20000)
     robot_config_overrides: dict[str, Any] = Field(default_factory=dict)
     parser_config: dict[str, Any] = Field(default_factory=dict)
     data_check_config: dict[str, Any] = Field(default_factory=dict)

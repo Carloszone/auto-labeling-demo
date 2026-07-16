@@ -15,9 +15,9 @@
 
 - 前端和后端部署在同一台 Linux 服务主机。
 - 后端监听 `0.0.0.0:8000`，局域网客户端通过 `http://<server-ip>:8000` 访问。
-- 单次上传一个 MCAP 和一个 robot config JSON。
-- 服务同一时间只保存和运行一个工作项。
-- MCAP 最大 5 GiB，上传到后端本地临时目录。
+- 单次上传 1–32 个属于同一连续任务的 MCAP 和一个 robot config JSON。
+- 服务同一时间只运行一个当前工作项，并在进程内保留最近 5 个成功工作项供查看、复核和导出。
+- 工作项内所有 MCAP 合计最大 50 GiB，上传到后端本地临时目录。
 - 串行调用 Parser、DataCheck、EventGeneration 和 EventLabeling。
 - 使用 PyAV 将各摄像头对齐帧编码为 H.264 MP4。
 - 提供进度、视频、event、异常区间、人工复核和 JSON 导出接口。
@@ -25,7 +25,7 @@
 
 ### 2.2 MVP 不包含
 
-- 多 MCAP 拼接、批次处理和多任务并发。
+- 多工作项并发和跨任务批处理。
 - 数据库、S3 和服务重启后的任务恢复。
 - 登录、角色、权限和公网安全能力。
 - 任务取消、断点续传和阶段级续跑。
@@ -75,10 +75,10 @@ FastAPI :8000
 | `AUTO_LABEL_HOST` | `0.0.0.0` | HTTP 监听地址 |
 | `AUTO_LABEL_PORT` | `8000` | HTTP 监听端口 |
 | `AUTO_LABEL_WORKSPACE_ROOT` | `/tmp/auto-labeling-demo` | 临时工作目录 |
-| `AUTO_LABEL_MAX_UPLOAD_BYTES` | `5368709120` | MCAP 最大 5 GiB |
+| `AUTO_LABEL_MAX_UPLOAD_BYTES` | `53687091200` | 工作项内 MCAP 合计最大 50 GiB |
 | `AUTO_LABEL_WORKER_ID` | `1` | 雪花 ID worker ID，范围 0–1023 |
 | `AUTO_LABEL_VLM_ENDPOINT` | 无默认值 | VLM HTTP 地址 |
-| `AUTO_LABEL_VLM_TIMEOUT_SEC` | `120` | 单次 VLM 请求超时 |
+| `AUTO_LABEL_VLM_TIMEOUT_SEC` | `300` | 单次 VLM 请求超时；仅约束单次 Event 的 VLM HTTP 调用，不是整个 Pipeline 总时长 |
 | `AUTO_LABEL_ENV_FILE` | `<项目根目录>/.env` | 可选的环境变量文件路径 |
 | `AUTO_LABEL_LOG_PATH` | `logs/auto-labeling-demo.log` | 后端日志文件 |
 | `AUTO_LABEL_LOG_LEVEL` | `INFO` | 日志等级 |
@@ -88,10 +88,10 @@ FastAPI :8000
 ## 4. 服务模块
 
 1. `DemoJobService`
-   - 持有唯一的 `CurrentJob`。
+   - 持有唯一的 `CurrentJob` 和最多 5 个成功历史工作项。
    - 负责状态机、雪花 ID、互斥和工作项替换。
 2. `UploadService`
-   - 校验 multipart 字段和文件大小。
+   - 校验一个或多个 `mcaps` multipart 字段、robot config 和文件合计大小。
    - 将上传内容流式写入 `.part`，成功后原子改名。
 3. `LocalWorkspaceService`
    - 创建、清理当前工作目录。
@@ -102,6 +102,10 @@ FastAPI :8000
 5. `VideoArtifactService`
    - 使用 Parser 对齐后的 `image_list` 生成各相机 MP4。
    - 主相机失败则任务失败；非主相机失败记录 warning 并继续。
+8. `MultiMcapPreflightService`
+   - 仅读取每个 MCAP 的 `main_time_topic` 元数据，按实际起止时间戳排序。
+   - 检查重叠和缺口；禁止使用上传顺序或文件名序号直接排序。
+   - 输出 `segment_manifest`，记录接受帧数和重叠丢弃帧数。
 6. `AnnotationReviewService`
    - 返回标准化 EventView。
    - 保存 event 编辑和 `review_status`。
@@ -117,9 +121,13 @@ FastAPI :8000
 CurrentJob
 ├── job_id: str
 ├── file_name: str
+├── file_names: list[str]
+├── mcap_count: int
 ├── file_size_bytes: int
 ├── workspace_path: Path
 ├── mcap_path: Path
+├── mcap_paths: list[Path]
+├── segment_manifest: list[SegmentManifest]
 ├── robot_config_path: Path
 ├── status: JobStatus
 ├── stage: JobStage
@@ -129,6 +137,7 @@ CurrentJob
 ├── warnings: list[WarningView]
 ├── effective_config: dict
 ├── input_prompt: str
+├── system_prompt: str
 ├── duration_sec: float | null
 ├── cameras: list[CameraInfo]
 ├── events: list[EventView]
@@ -140,6 +149,20 @@ CurrentJob
 └── updated_at: ISO-8601 string
 ```
 
+### 5.2 多 MCAP 内部固定策略
+
+以下策略只存在于后端规范和 `MULTI_MCAP_POLICY`，不通过 `/api/v1/config.pipeline_defaults` 返回，也不允许 `RunRequest` 覆盖：
+
+- `fps=30`，使用整数帧号生成统一相对纳秒时间轴。
+- `max_segment_count=32`。
+- `continuous_gap_sec=0.066666667`。
+- `max_video_fill_gap_sec=0.2`。
+- `max_motion_interpolation_gap_sec=0.2`。
+- `overlap_policy=earlier_mcap_wins`：按主相机记录时间戳排序后，重叠部分保留前一个 MCAP。
+- `large_gap_policy=fail`：边界缺口达到视频补帧阈值时任务失败；较小缺口允许重复最近图像帧并对连续运动量插值。
+
+上传写入仍采用 `.part` 加原子改名。预扫描全部成功后才正式解析；原始 MCAP 按实际时间顺序逐文件读取，不同时将多个原始文件内容载入内存。第一版下游兼容层仍会保存拼接后的 JPEG 压缩 `image_list`，后续磁盘化阶段将改为图像质检流式执行、VLM 按帧索引回读原始 MCAP。
+
 `AnomalyRangeView.topics` 为单一 topic 字符串，`descs` 为字符串列表。DataCheck 当前只在同 topic、同异常类型内执行区间合并，禁止跨 topic 融合。异常复核状态属于前端临时展示状态，不通过后端保存，也不影响导出。
 
 - `DemoJobService` 使用 `threading.RLock` 保护状态读写。
@@ -147,7 +170,7 @@ CurrentJob
 - 后台线程每次更新状态时同时更新 `updated_at`。
 - 进度只能增加，重跑时先显式归零。
 
-### 5.2 雪花 ID
+### 5.3 雪花 ID
 
 - 工作项 ID 为 `job<雪花ID>`。
 - 使用 41 位毫秒时间戳、10 位 worker ID 和 12 位毫秒内序列号。
@@ -162,8 +185,12 @@ CurrentJob
 ```text
 /tmp/auto-labeling-demo/{job_id}/
 ├── input/
-│   ├── source.mcap
-│   └── source.mcap.part
+│   ├── segment_000.mcap
+│   ├── segment_001.mcap
+│   └── segment_NNN.mcap.part
+├── metadata/
+│   ├── segments.json
+│   └── frames.json
 ├── config/
 │   ├── robot.json
 │   └── effective_pipeline.json
@@ -180,11 +207,11 @@ CurrentJob
 规则：
 
 - 上传时每次读取 8 MiB，累计大小超过限制立即失败。
-- 客户端文件名只用于页面展示；服务器固定保存为 `source.mcap` 和 `robot.json`，避免路径穿越。
+- 客户端文件名只用于页面展示；服务器将 MCAP 保存为 `segment_NNN.mcap`、配置保存为 `robot.json`，避免路径穿越。`NNN` 仅代表上传序号，解析和拼接顺序必须依据 MCAP 内主时间 topic 的时间戳。
 - JSON 和标注文件先写入同目录临时文件，再使用 `os.replace()` 原子替换。
 - 服务启动时清理 workspace root 下所有旧工作目录和 `.part` 文件，因为 MVP 不恢复任务。
 - 正常关闭时尝试清理当前目录；清理失败只记录日志，不阻止进程退出。
-- 创建新工作项时自动删除旧的 `ready` 或 `failed` 工作项；旧任务正在运行时返回 409。
+- 创建新工作项时将旧的 `ready` 工作项加入最近成功历史，删除 `failed` 或未完成工作项；历史超过 5 条时删除最早成功工作项及目录。旧任务正在运行时返回 409。
 - 导出文件通过 HTTP 下载到客户端，不额外复制到服务器其他目录。
 - 创建工作项之前检查 workspace root 至少有 6 GiB 可用空间；不足时返回 507。
 
@@ -265,6 +292,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 ```json
 {
   "input_prompt": "这是一段机器人操作视频……",
+  "system_prompt": "你是一位……具身智能数据标注专家……",
   "robot_config_overrides": {
     "main_time_topic": "/gripper/camera_fisheye_r/color/image_raw"
   },
@@ -329,8 +357,9 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 - `context_frame_len`：整数，0–10。
 - `main_time_topic`：必须匹配上传 robot config 中某个 camera topic。
 - `input_prompt`：去除首尾空白后最多 8000 个字符；空值使用后端默认 Prompt。
+- `system_prompt`：去除首尾空白后最多 20000 个字符；空值使用后端默认 System Prompt。
 
-固定不开放的策略仍由后端提供：`fps=30`、Savitzky-Golay 默认平滑、`clinear + Pelt + HSMM`、`pass_through + adjacent_by_topic`、VLM model/System Prompt 和输出层级。
+固定不开放的策略仍由后端提供：`fps=30`、Savitzky-Golay 默认平滑、`clinear + Pelt + HSMM`、`pass_through + adjacent_by_topic`、VLM model 和输出层级。System Prompt 有后端默认值，但允许随运行请求覆盖。
 
 ## 11. API 通用规范
 
@@ -363,7 +392,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 | 404 | `EVENT_NOT_FOUND` | event ID 不存在 |
 | 409 | `JOB_RUNNING` | 运行中重复启动、覆盖或删除 |
 | 409 | `INVALID_JOB_STATE` | 当前状态不允许该操作 |
-| 413 | `UPLOAD_TOO_LARGE` | MCAP 超过 5 GiB |
+| 413 | `UPLOAD_TOO_LARGE` | MCAP 合计超过 50 GiB |
 | 422 | `CONFIG_VALIDATION_FAILED` | 算法参数越界 |
 | 422 | `EVENT_VALIDATION_FAILED` | event 时间或字段非法 |
 | 500 | `PIPELINE_FAILED` | 算法执行异常 |
@@ -408,7 +437,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 
 ```json
 {
-  "max_upload_bytes": 5368709120,
+  "max_upload_bytes": 53687091200,
   "fps": 30,
   "default_input_prompt": "这是一段机器人操作视频……",
   "pipeline_defaults": {
@@ -417,7 +446,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
     "event_labeling_config": {}
   },
   "capabilities": {
-    "multi_mcap": false,
+    "multi_mcap": true,
     "cancel": false,
     "timeline_zoom": false
   }
@@ -434,7 +463,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 
 | 字段 | 类型 | 必需 | 规则 |
 |---|---|---:|---|
-| `mcap` | file | 是 | 单个 `.mcap`，最大 5 GiB |
+| `mcaps` | file[] | 是 | 一个或多个 `.mcap`，合计最大 50 GiB；重复 multipart 字段 |
 | `robot_config` | file | 是 | 单个 UTF-8 JSON，最大 2 MiB |
 
 上传进度由浏览器根据请求已发送字节计算。接口在文件落盘并完成基础校验后返回。
@@ -462,7 +491,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 }
 ```
 
-当前工作项为 `running` 时返回 409；为 `ready_to_run`、`ready` 或 `failed` 时，接口先清理旧工作项再创建新工作项。
+当前工作项为 `running` 时返回 409；旧工作项为 `ready` 时归入最近成功历史，为 `ready_to_run` 或 `failed` 时清理后再创建新工作项。历史超过 5 条时清理最早完成项。
 
 ### 12.3 获取当前工作项
 
@@ -470,6 +499,15 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 
 - 有当前工作项：返回 `200 JobSummary`。
 - 没有当前工作项：返回 404 `JOB_NOT_FOUND`。
+
+### 12.3.1 获取最近成功工作项
+
+`GET /api/v1/jobs/history`
+
+- 返回按完成时间从新到旧排列的 `JobSummary[]`，最多 5 条。
+- 仅包含成功完成的工作项；当前项若已成功，也包含在列表中且不会重复。
+- 记录仅在当前后端进程内有效，服务重启后不恢复。
+- 历史工作项允许读取结果、修改复核状态和导出，但调用运行接口返回 409。
 
 ### 12.4 获取指定工作项状态
 
@@ -645,7 +683,8 @@ AnomalyRangeView 统一为：
 - robot config JSON 非法或必需 topic 缺失：创建工作项失败或运行进入 `failed`。
 - 主视频生成失败：任务进入 `failed`。
 - 非主视频生成失败：记录 warning，继续算法和页面展示。
-- VLM 网络失败、超时或返回非法 JSON：任务进入 `failed`，已完成的临时结果不作为正式标注返回。
+- VLM 单次请求失败：对应 Event 写入失败标注并继续；只有 EventLabeling 自身结构错误或结果保存失败才使任务进入 `failed`。
+- VLM 返回非 2xx HTTP 状态时，日志记录状态码、reason、Content-Type、图片数、请求体字节数、耗时和最多 20000 字符的错误响应正文；正文超限时记录截断标记。
 - 无 event：任务正常进入 `ready`，events 为空，视频仍可播放。
 - `.part`、视频或 JSON 写入失败：进入 `failed` 并记录磁盘错误。
 - 上传过程中客户端断线：清理 `.part`；客户端重新完整上传。
@@ -675,6 +714,11 @@ AnomalyRangeView 统一为：
 
 ## 16. 更新记录
 
+- 2026-07-16：`RunRequest` 新增可选 `system_prompt`，最多 20000 字符；空值使用后端默认值，并与 User Prompt 一同写入有效配置后传给 EventLabeling。
+- 2026-07-15：新增最近 5 个成功工作项历史接口；历史项保留视频、标注、异常和复核能力，但禁止重新运行。
+- 2026-07-15：VLM HTTP 错误日志新增响应正文、状态码、内容类型、请求规模和截断标记，便于定位服务端 500。
+- 2026-07-15：根据本地 VLM 长响应情况，将单次 HTTP 请求超时默认值由 120 秒延长至 300 秒。
+- 2026-07-15：新增多 MCAP 上传和时间戳预扫描合并；内部固定边界策略不暴露给页面，上传顺序仅保留用于展示和完全同时间范围时的确定性仲裁。
 - 2026-07-15：异常区间接口的 `topics` 调整为单一字符串；明确后端不保存数据/图像异常的临时复核状态，导出逻辑保持不变。
 - 2026-07-14：补完可运行 Demo 技术选型、状态机、进度、视频、文件、错误和完整 HTTP API 规范，作为第一版实施基线。
 - 2026-07-14：确定前后端同机部署、其他主机通过 HTTP 访问；输入改为文件上传到本地临时目录，EventLabeler 输出增加 `review_status=pending`。

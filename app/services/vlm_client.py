@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -12,6 +13,7 @@ from json_repair import repair_json
 
 
 LOGGER = logging.getLogger(__name__)
+MAX_ERROR_BODY_CHARS = 20_000
 
 
 class HttpVlmClient:
@@ -31,9 +33,10 @@ class HttpVlmClient:
             "system_prompt": system_prompt,
             "input": self._build_input(input_prompt, samples),
         }
+        encoded_payload = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             self.endpoint,
-            data=json.dumps(payload).encode("utf-8"),
+            data=encoded_payload,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
@@ -45,6 +48,24 @@ class HttpVlmClient:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
                 raw_response = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            try:
+                error_body = exc.read().decode("utf-8", errors="replace")
+            except Exception as read_exc:
+                error_body = f"<failed to read HTTP error body: {read_exc}>"
+            exc.vlm_error_body = error_body[:MAX_ERROR_BODY_CHARS]
+            content_type = exc.headers.get("Content-Type", "") if exc.headers else ""
+            LOGGER.error(
+                "vlm_http_error endpoint=%s model=%s status_code=%s reason=%r "
+                "content_type=%r image_count=%s request_bytes=%s duration_sec=%.6f "
+                "error_body=%r body_truncated=%s",
+                self.endpoint, model, exc.code, exc.reason, content_type,
+                sum(len(items) for items in samples.values()), len(encoded_payload),
+                time.perf_counter() - started, error_body[:MAX_ERROR_BODY_CHARS],
+                len(error_body) > MAX_ERROR_BODY_CHARS,
+                exc_info=True,
+            )
+            raise
         except Exception:
             LOGGER.exception(
                 "vlm_http_failed endpoint=%s model=%s duration_sec=%.6f",

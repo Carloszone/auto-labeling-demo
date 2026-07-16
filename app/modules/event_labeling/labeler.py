@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import logging
 import time
+import urllib.error
 from typing import Any, Callable, Protocol
 
 
@@ -84,6 +85,17 @@ class EventLabeler:
                 fixed_frame_len,
                 context_frame_len,
                 topic_key,
+                context={
+                    "task_id": task_id,
+                    "job_id": job_id,
+                    "period": period,
+                    "camera_schema": parser_info.get("camera_schema", []),
+                    "state_schema": parser_info.get("state_schema", []),
+                    "action_schema": parser_info.get("action_schema", []),
+                    "segment_manifest": parser_info.get("segment_manifest", []),
+                    "frame_manifest": parser_info.get("frame_manifest", []),
+                    "main_time_camera_key": parser_info.get("main_time_camera_key"),
+                },
             )
             topic_samples = samples[topic_key]
             sample_manifest = [
@@ -124,13 +136,17 @@ class EventLabeler:
                     input_prompt=str(vlm_params.get("input_prompt", "")),
                     samples=samples,
                 )
-            except Exception:
+            except Exception as exc:
                 LOGGER.exception(
                     "vlm_call_failed task_id=%s job_id=%s topic_key=%s start_index=%s end_index=%s duration_sec=%.6f",
                     task_id, job_id, topic_key, period["start_index"], period["end_index"],
                     time.perf_counter() - vlm_started,
                 )
-                raise
+                vlm_result = {
+                    "action_summary": self._vlm_error_summary(exc),
+                    "action_state": -1,
+                    "detailed_description": self._vlm_error_detail(exc),
+                }
             LOGGER.info(
                 "vlm_output task_id=%s job_id=%s topic_key=%s start_index=%s end_index=%s duration_sec=%.6f result=%s",
                 task_id, job_id, topic_key, period["start_index"], period["end_index"],
@@ -149,6 +165,22 @@ class EventLabeler:
                 self._progress_callback(completed, len(periods))
 
         return {"task_id": task_id, "job_id": basic.get("job_id"), "response": response}
+
+    def _vlm_error_summary(self, exc: Exception) -> str:
+        """Return a concise failed annotation instead of aborting the batch."""
+
+        if isinstance(exc, urllib.error.HTTPError):
+            return f"VLM请求失败（HTTP {exc.code}）"
+        return f"VLM请求失败（{type(exc).__name__}）"
+
+    def _vlm_error_detail(self, exc: Exception) -> str:
+        """Preserve useful VLM failure details in the generated annotation."""
+
+        if isinstance(exc, urllib.error.HTTPError):
+            body = str(getattr(exc, "vlm_error_body", ""))
+            suffix = f"；服务端响应：{body}" if body else ""
+            return f"VLM服务返回HTTP {exc.code} {exc.reason}{suffix}"[:4000]
+        return f"{type(exc).__name__}: {exc}"[:4000]
 
     def _validated_periods(
         self, timestamps: list[dict[str, str]], periods: list[dict[str, Any]]
@@ -201,6 +233,7 @@ class EventLabeler:
         fixed_frame_len: int,
         context_frame_len: int,
         topic_key: str,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, list[dict[str, Any]]]:
         """Sample the event plus context frames before and after without changing it."""
 
@@ -219,12 +252,84 @@ class EventLabeler:
             raise ValueError("sample images must be unique and ordered chronologically")
         samples: dict[str, list[dict[str, Any]]] = {}
         for frame_index, sample_role in indexed_roles:
-            image = image_list[frame_index].get(topic_key)
+            frame_images = image_list[frame_index]
+            image = frame_images.get(topic_key)
             if image is None:
-                raise ValueError(f"sample image topic is missing: {topic_key}")
+                context = context or {}
+                frame_manifest = context.get("frame_manifest")
+                frame_source = None
+                if isinstance(frame_manifest, list) and 0 <= frame_index < len(frame_manifest):
+                    frame_source = frame_manifest[frame_index]
+                available_image_keys = sorted(str(key) for key in frame_images.keys())
+                camera_keys = [
+                    str(item.get("key", ""))
+                    for item in context.get("camera_schema", [])
+                    if isinstance(item, dict)
+                ]
+                state_keys = [
+                    str(item.get("key", ""))
+                    for item in context.get("state_schema", [])
+                    if isinstance(item, dict)
+                ]
+                action_keys = [
+                    str(item.get("key", ""))
+                    for item in context.get("action_schema", [])
+                    if isinstance(item, dict)
+                ]
+                LOGGER.error(
+                    "sample_image_topic_missing task_id=%s job_id=%s topic_key=%s "
+                    "frame_index=%s sample_role=%s start_index=%s end_index=%s "
+                    "timestamp=%s frame_source=%s available_image_keys=%s "
+                    "camera_keys=%s state_keys=%s action_keys=%s main_time_camera_key=%s "
+                    "segment_manifest=%s period=%s",
+                    context.get("task_id"),
+                    context.get("job_id"),
+                    topic_key,
+                    frame_index,
+                    sample_role,
+                    start_index,
+                    end_index,
+                    timestamps[frame_index] if 0 <= frame_index < len(timestamps) else None,
+                    frame_source,
+                    available_image_keys,
+                    camera_keys,
+                    state_keys,
+                    action_keys,
+                    context.get("main_time_camera_key"),
+                    context.get("segment_manifest"),
+                    context.get("period"),
+                )
+                raise ValueError(
+                    "sample image topic is missing: "
+                    f"{topic_key}; frame_index={frame_index}; sample_role={sample_role}; "
+                    f"available_image_keys={available_image_keys}; camera_keys={camera_keys}; "
+                    f"state_keys={state_keys}; action_keys={action_keys}; frame_source={frame_source}"
+                )
             raw = image.get("raw")
             if raw is None:
-                raise ValueError("sample image is missing raw bytes")
+                context = context or {}
+                frame_manifest = context.get("frame_manifest")
+                frame_source = None
+                if isinstance(frame_manifest, list) and 0 <= frame_index < len(frame_manifest):
+                    frame_source = frame_manifest[frame_index]
+                LOGGER.error(
+                    "sample_image_raw_missing task_id=%s job_id=%s topic_key=%s frame_index=%s "
+                    "sample_role=%s image_keys=%s timestamp=%s frame_source=%s",
+                    context.get("task_id"),
+                    context.get("job_id"),
+                    topic_key,
+                    frame_index,
+                    sample_role,
+                    sorted(str(key) for key in image.keys()),
+                    timestamps[frame_index] if 0 <= frame_index < len(timestamps) else None,
+                    frame_source,
+                )
+                raise ValueError(
+                    "sample image is missing raw bytes: "
+                    f"topic_key={topic_key}; frame_index={frame_index}; "
+                    f"sample_role={sample_role}; frame_source={frame_source}; "
+                    f"image_keys={sorted(str(key) for key in image.keys())}"
+                )
             samples.setdefault(topic_key, []).append(
                 {
                     "frame_index": frame_index,

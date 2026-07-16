@@ -11,3 +11,4 @@ frontend/dist/
 .env.*
 !.env.example
 logs/
+issue/*

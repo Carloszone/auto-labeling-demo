@@ -479,6 +479,7 @@ MVP 阶段默认采用 fail-fast 策略。
 4. 极值检测能基于 `degree`、`expansion_coef`、`min_tor` 生成正常区间，并输出超限异常结果。
 5. `EndEffectorDetector` 能从 `role = "end_effector"` 的 topic 检测状态变化 trigger，并输出独立的 `trigger_points`。
 6. 在启用图像检测时，模块能输出黑帧、模糊帧、损坏帧和静止帧检测结果。
+   对多 MCAP 小缺口自动生成且标记为 `alignment_filled` 的补帧跳过图像异常检测，避免把对齐产物误报为真实图像异常。
 7. 数据融合能按 `min_low_quality_time_sec` 过滤短异常片段，并按 `max_gap_time_sec` 合并同 topic、同类型的相邻异常区间；不同 topic 始终独立输出。
 8. 正常输入且没有异常或 trigger 时，模块输出空的 `data_anomaly_ranges`、`img_anomaly_ranges` 和 `trigger_points`，并保持 `check_list` 全 0。
 9. `check_list` 长度始终等于 `timestamp_list` 长度。
@@ -493,6 +494,7 @@ MVP 阶段默认采用 fail-fast 策略。
 
 ## 更新记录
 
+- 2026-07-15：图像质检跳过多 MCAP 对齐阶段生成的 `alignment_filled` 补帧，防止合成帧污染异常结果。
 - 2026-07-15：暂时禁用异常区间的跨 topic 合并；仅合并同 topic、同类型异常，`topics` 改为只含一个 topic 的字符串，`descs` 改为该 topic 的描述列表。
 - 2026-07-13：时间配置统一使用秒并以 `_sec` 命名，内部固定按 30 FPS 换算；仍按帧执行的平滑窗口和搜索步长改为带 `frame` 的字段名。
 - 2026-07-13：变化节点取消“运动开始/恢复稳定”标签；节点按摄像头 topic 独立输出，并在 evidence 中保留末端执行器检测来源。

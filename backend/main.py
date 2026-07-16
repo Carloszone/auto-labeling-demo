@@ -116,20 +116,32 @@ async def config() -> dict:
             "event_generation_config": copy_defaults(EVENT_GENERATION_DEFAULTS),
             "event_labeling_config": copy_defaults(EVENT_LABELING_DEFAULTS),
         },
-        "capabilities": {"multi_mcap": False, "cancel": False, "timeline_zoom": False},
+        "capabilities": {"multi_mcap": True, "cancel": False, "timeline_zoom": False},
     }
 
 
 @app.post("/api/v1/jobs", status_code=201)
 async def create_job(
-    mcap: UploadFile = File(...), robot_config: UploadFile = File(...)
+    robot_config: UploadFile = File(...),
+    mcaps: list[UploadFile] | None = File(default=None),
+    mcap: UploadFile | None = File(default=None),
 ) -> dict:
-    return await jobs.create_job(mcap, robot_config)
+    uploads = list(mcaps or [])
+    if mcap is not None:
+        uploads.append(mcap)
+    if not uploads:
+        raise ApiError(400, "INVALID_MCAP", "至少需要上传一个 MCAP 文件")
+    return await jobs.create_job(uploads, robot_config)
 
 
 @app.get("/api/v1/jobs/current")
 async def current_job() -> dict:
     return jobs.current_summary()
+
+
+@app.get("/api/v1/jobs/history")
+async def job_history() -> list[dict]:
+    return jobs.history()
 
 
 @app.get("/api/v1/jobs/{job_id}")

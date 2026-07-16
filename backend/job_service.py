@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,7 +22,7 @@ import numpy as np
 from fastapi import UploadFile
 
 from app.core.config import load_robot_config
-from app.core.defaults import DEFAULT_INPUT_PROMPT, EVENT_GENERATION_DEFAULTS
+from app.core.defaults import DEFAULT_INPUT_PROMPT, DEFAULT_SYSTEM_PROMPT, EVENT_GENERATION_DEFAULTS, MULTI_MCAP_POLICY
 from app.modules.event_labeling.labeler import EventLabeler
 from app.services.orchestrator import AutoLabelingService
 from app.services.vlm_client import HttpVlmClient
@@ -76,6 +77,7 @@ class JobService:
         self.settings = settings
         self._lock = threading.RLock()
         self._job: dict[str, Any] | None = None
+        self._history: dict[str, dict[str, Any]] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-label")
         self._ids = SnowflakeGenerator(settings.worker_id)
         self._pipeline = AutoLabelingService()
@@ -89,13 +91,16 @@ class JobService:
             elif child.suffix == ".part":
                 child.unlink(missing_ok=True)
 
-    async def create_job(self, mcap: UploadFile, robot_config: UploadFile) -> dict[str, Any]:
-        """Stream both uploaded files to a new workspace and validate robot JSON."""
+    async def create_job(self, mcaps: list[UploadFile], robot_config: UploadFile) -> dict[str, Any]:
+        """Stream an MCAP set plus robot JSON to a new workspace."""
+
+        if len(mcaps) > int(MULTI_MCAP_POLICY["max_segment_count"]):
+            raise ApiError(400, "TOO_MANY_MCAPS", "MCAP 文件数量超过内部限制")
 
         with self._lock:
             if self._job and self._job["status"] == "running":
                 raise ApiError(409, "JOB_RUNNING", "当前工作项正在运行，不能创建新工作项")
-            self._delete_locked()
+            self._rotate_current_locked()
             free_bytes = shutil.disk_usage(self.settings.workspace_root).free
             if free_bytes < self.settings.min_free_bytes:
                 raise ApiError(507, "INSUFFICIENT_STORAGE", "临时目录可用空间不足 6 GiB")
@@ -104,15 +109,20 @@ class JobService:
             (workspace / "input").mkdir(parents=True)
             (workspace / "config").mkdir()
             (workspace / "videos").mkdir()
+            (workspace / "metadata").mkdir()
             (workspace / "annotations").mkdir()
             (workspace / "export").mkdir()
             now = _utc_now()
             self._job = {
                 "job_id": job_id,
-                "file_name": Path(mcap.filename or "source.mcap").name,
+                "file_name": Path(mcaps[0].filename or "source.mcap").name,
+                "file_names": [Path(item.filename or f"segment_{index:03d}.mcap").name for index, item in enumerate(mcaps)],
+                "mcap_count": len(mcaps),
                 "file_size_bytes": 0,
                 "workspace_path": workspace,
-                "mcap_path": workspace / "input" / "source.mcap",
+                "mcap_path": workspace / "input" / "segment_000.mcap",
+                "mcap_paths": [workspace / "input" / f"segment_{index:03d}.mcap" for index in range(len(mcaps))],
+                "segment_manifest": [],
                 "robot_config_path": workspace / "config" / "robot.json",
                 "status": "validating",
                 "stage": "validating",
@@ -133,17 +143,24 @@ class JobService:
                 "vlm_completed_count": 0,
                 "vlm_total_count": 0,
                 "created_at": now,
+                "completed_at": None,
                 "updated_at": now,
                 "available_camera_topics": [],
                 "main_time_topic": None,
             }
 
         try:
-            if not (mcap.filename or "").lower().endswith(".mcap"):
-                raise ApiError(400, "INVALID_MCAP", "MCAP 文件扩展名必须为 .mcap")
-            size = await self._stream_upload(mcap, self._job["mcap_path"], self.settings.max_upload_bytes)
-            if size == 0:
-                raise ApiError(400, "INVALID_MCAP", "MCAP 文件不能为空")
+            size = 0
+            for index, upload in enumerate(mcaps):
+                if not (upload.filename or "").lower().endswith(".mcap"):
+                    raise ApiError(400, "INVALID_MCAP", "MCAP 文件扩展名必须为 .mcap")
+                remaining = self.settings.max_upload_bytes - size
+                if remaining <= 0:
+                    raise ApiError(413, "UPLOAD_TOO_LARGE", "MCAP 文件总大小超过允许值")
+                file_size = await self._stream_upload(upload, self._job["mcap_paths"][index], remaining)
+                if file_size == 0:
+                    raise ApiError(400, "INVALID_MCAP", f"MCAP 文件不能为空: {upload.filename}")
+                size += file_size
             await self._stream_upload(robot_config, self._job["robot_config_path"], 2 * 1024 * 1024)
             try:
                 config = load_robot_config(self._job["robot_config_path"])
@@ -170,17 +187,18 @@ class JobService:
                     "updated_at": _utc_now(),
                 })
                 LOGGER.info(
-                    "job_created job_id=%s file_name=%s file_size_bytes=%s main_time_topic=%s cameras=%s",
-                    job_id, self._job["file_name"], size, config.main_time_topic,
+                    "job_created job_id=%s file_names=%s file_size_bytes=%s main_time_topic=%s cameras=%s",
+                    job_id, json.dumps(self._job["file_names"], ensure_ascii=False), size, config.main_time_topic,
                     json.dumps(topics, ensure_ascii=False),
                 )
                 return self.summary(job_id)
         except Exception:
             with self._lock:
-                self._delete_locked()
+                self._delete_current_locked()
             raise
         finally:
-            await mcap.close()
+            for upload in mcaps:
+                await upload.close()
             await robot_config.close()
 
     async def _stream_upload(self, upload: UploadFile, target: Path, limit: int) -> int:
@@ -206,17 +224,23 @@ class JobService:
         """Submit the pipeline to the sole background worker."""
 
         with self._lock:
+            if not self._job or self._job["job_id"] != job_id:
+                raise ApiError(409, "HISTORY_READ_ONLY", "历史工作项不能重新运行")
             job = self._require(job_id)
             if job["status"] == "running":
                 raise ApiError(409, "JOB_RUNNING", "当前工作项正在运行")
             if job["status"] not in {"ready_to_run", "ready", "failed"}:
                 raise ApiError(409, "INVALID_JOB_STATE", "当前状态不能启动自动标注")
             self._clear_artifacts(job)
+            effective_config = request.model_dump(exclude_none=True)
+            effective_config["input_prompt"] = request.input_prompt.strip() or DEFAULT_INPUT_PROMPT
+            effective_config["system_prompt"] = request.system_prompt.strip() or DEFAULT_SYSTEM_PROMPT
             job.update({
                 "status": "running", "stage": "parsing", "progress": 5,
                 "message": "自动标注已启动", "error": None, "warnings": [],
-                "effective_config": request.model_dump(exclude_none=True),
-                "input_prompt": request.input_prompt.strip() or DEFAULT_INPUT_PROMPT,
+                "effective_config": effective_config,
+                "input_prompt": effective_config["input_prompt"],
+                "system_prompt": effective_config["system_prompt"],
                 "updated_at": _utc_now(),
             })
             self._atomic_json(job["workspace_path"] / "config" / "effective_pipeline.json", job["effective_config"])
@@ -228,13 +252,15 @@ class JobService:
             return self.summary(job_id)
 
     def _clear_artifacts(self, job: dict[str, Any]) -> None:
-        for folder in ("videos", "annotations", "export"):
+        for folder in ("videos", "metadata", "annotations", "export"):
             path = job["workspace_path"] / folder
             shutil.rmtree(path, ignore_errors=True)
             path.mkdir()
         job.update({
             "duration_sec": None, "main_camera_key": None, "cameras": [], "events": [],
+            "completed_at": None,
             "data_anomaly_ranges": [], "image_anomaly_ranges": [], "timeline_ns": [],
+            "segment_manifest": [],
             "vlm_completed_count": 0, "vlm_total_count": 0,
             "raw_result": {"task_id": job["job_id"], "job_id": job["job_id"], "response": []},
         })
@@ -244,7 +270,7 @@ class JobService:
         try:
             with self._lock:
                 job = self._require(job_id)
-                mcap_path = job["mcap_path"]
+                mcap_paths = list(job["mcap_paths"])
                 robot_path = job["robot_config_path"]
                 workspace = job["workspace_path"]
             robot = load_robot_config(robot_path)
@@ -257,10 +283,13 @@ class JobService:
 
             self._set_stage(job_id, "parsing", 5, "正在解析和对齐 MCAP")
             parser_request = self._pipeline._parser_request(
-                job_id, job_id, mcap_path, robot, None, request.parser_config
+                job_id, job_id, mcap_paths[0], robot, None, request.parser_config
             )
+            parser_request["parser"]["mcap_paths"] = mcap_paths
             with self._timed(job_id, "parser"):
                 parser_info = self._pipeline.parser.parse(parser_request)
+            self._atomic_json(workspace / "metadata" / "segments.json", parser_info.get("segment_manifest", []))
+            self._atomic_json(workspace / "metadata" / "frames.json", parser_info.get("frame_manifest", []))
             timestamps_ns = [int(item["timestamp_ns"]) for item in parser_info["timestamp_list"]]
             duration = max(0.0, (timestamps_ns[-1] - timestamps_ns[0]) / 1e9)
             LOGGER.info(
@@ -268,7 +297,12 @@ class JobService:
                 job_id, len(timestamps_ns), duration, parser_info["main_time_camera_key"],
                 len(parser_info.get("state_schema", [])), len(parser_info.get("action_schema", [])),
             )
+            LOGGER.info(
+                "multi_mcap_manifest job_id=%s segments=%s",
+                job_id, json.dumps(parser_info.get("segment_manifest", []), ensure_ascii=False),
+            )
             self._update(job_id, timeline_ns=timestamps_ns, duration_sec=duration, main_camera_key=parser_info["main_time_camera_key"])
+            self._update(job_id, segment_manifest=deepcopy(parser_info.get("segment_manifest", [])))
 
             self._set_stage(job_id, "video_generating", 25, "正在生成摄像头视频")
             with self._timed(job_id, "video_generation"):
@@ -306,7 +340,10 @@ class JobService:
             self._set_stage(job_id, "vlm_labeling", 65, f"正在标注 event（0/{total_events}）")
             label_config = self._pipeline._event_labeling_config(
                 request.event_labeling_config,
-                {"input_prompt": request.input_prompt.strip() or DEFAULT_INPUT_PROMPT},
+                {
+                    "input_prompt": request.input_prompt.strip() or DEFAULT_INPUT_PROMPT,
+                    "system_prompt": request.system_prompt.strip() or DEFAULT_SYSTEM_PROMPT,
+                },
             )
             label_config.pop("basic", None)
             if self.settings.vlm_endpoint:
@@ -338,9 +375,12 @@ class JobService:
             image_ranges = self._anomaly_views(check_info["img_anomaly_ranges"], timestamps_ns[0])
             self._update(
                 job_id, status="ready", stage="ready", progress=100, message="自动标注完成",
+                completed_at=_utc_now(),
                 raw_result=raw_result, events=events, data_anomaly_ranges=data_ranges,
                 image_anomaly_ranges=image_ranges,
             )
+            with self._lock:
+                self._prune_history_locked()
             LOGGER.info(
                 "pipeline_completed job_id=%s event_count=%s duration_sec=%.6f",
                 job_id, len(events), time.perf_counter() - pipeline_started,
@@ -428,6 +468,8 @@ class JobService:
                         cv2.BORDER_CONSTANT,
                     )
                 video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+                video_frame.pts = index
+                video_frame.time_base = Fraction(1, 30)
                 for packet in stream.encode(video_frame):
                     container.mux(packet)
             for packet in stream.encode():
@@ -454,6 +496,7 @@ class JobService:
                 counts[event["review_status"]] += 1
             return {
                 "job_id": job["job_id"], "file_name": job["file_name"],
+                "file_names": deepcopy(job["file_names"]), "mcap_count": job["mcap_count"],
                 "file_size_bytes": job["file_size_bytes"], "status": job["status"],
                 "stage": job["stage"], "progress": job["progress"], "message": job["message"],
                 "duration_sec": job["duration_sec"], "camera_count": len(job["cameras"]),
@@ -463,7 +506,9 @@ class JobService:
                 "warnings": deepcopy(job["warnings"]), "error": deepcopy(job["error"]),
                 "available_camera_topics": deepcopy(job["available_camera_topics"]),
                 "main_time_topic": job["main_time_topic"],
-                "created_at": job["created_at"], "updated_at": job["updated_at"],
+                "segment_manifest": deepcopy(job["segment_manifest"]),
+                "created_at": job["created_at"], "completed_at": job["completed_at"],
+                "updated_at": job["updated_at"],
             }
 
     def current_summary(self) -> dict[str, Any]:
@@ -471,6 +516,16 @@ class JobService:
             if not self._job:
                 raise ApiError(404, "JOB_NOT_FOUND", "当前没有工作项")
             return self.summary(self._job["job_id"])
+
+    def history(self) -> list[dict[str, Any]]:
+        """Return at most five successful jobs, newest first."""
+
+        with self._lock:
+            jobs = list(self._history.values())
+            if self._job and self._job["status"] == "ready":
+                jobs.append(self._job)
+            jobs.sort(key=lambda item: item.get("completed_at") or item["updated_at"], reverse=True)
+            return [self.summary(item["job_id"]) for item in jobs[:5]]
 
     def result(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -580,17 +635,49 @@ class JobService:
             job = self._require(job_id)
             if job["status"] == "running":
                 raise ApiError(409, "JOB_RUNNING", "运行中的工作项不能删除")
-            self._delete_locked()
+            if self._job and self._job["job_id"] == job_id:
+                self._delete_current_locked()
+            else:
+                removed = self._history.pop(job_id)
+                shutil.rmtree(removed["workspace_path"], ignore_errors=True)
 
-    def _delete_locked(self) -> None:
+    def _delete_current_locked(self) -> None:
         if self._job:
             shutil.rmtree(self._job["workspace_path"], ignore_errors=True)
         self._job = None
 
+    def _rotate_current_locked(self) -> None:
+        """Archive a successful current job and discard unsuccessful state."""
+
+        if not self._job:
+            return
+        if self._job["status"] == "ready":
+            self._history[self._job["job_id"]] = self._job
+            self._job = None
+            self._prune_history_locked()
+        else:
+            self._delete_current_locked()
+
+    def _prune_history_locked(self) -> None:
+        """Keep five successful jobs total, counting a ready current job."""
+
+        history_limit = 4 if self._job and self._job["status"] == "ready" else 5
+        ordered = sorted(
+            self._history.values(),
+            key=lambda item: item.get("completed_at") or item["updated_at"], reverse=True,
+        )
+        keep = {item["job_id"] for item in ordered[:history_limit]}
+        for job_id in list(self._history):
+            if job_id not in keep:
+                removed = self._history.pop(job_id)
+                shutil.rmtree(removed["workspace_path"], ignore_errors=True)
+
     def _require(self, job_id: str) -> dict[str, Any]:
-        if not self._job or self._job["job_id"] != job_id:
-            raise ApiError(404, "JOB_NOT_FOUND", "工作项不存在")
-        return self._job
+        if self._job and self._job["job_id"] == job_id:
+            return self._job
+        if job_id in self._history:
+            return self._history[job_id]
+        raise ApiError(404, "JOB_NOT_FOUND", "工作项不存在")
 
     def _set_stage(self, job_id: str, stage: str, progress: int, message: str) -> None:
         self._update(job_id, status="running", stage=stage, progress=progress, message=message)

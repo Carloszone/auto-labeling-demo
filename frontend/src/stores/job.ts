@@ -10,6 +10,8 @@ export const useJobStore = defineStore('job', {
   state: () => ({
     config: null as ApiConfig | null,
     job: null as JobSummary | null,
+    currentJobId: '' as string,
+    history: [] as JobSummary[],
     result: { ...EMPTY_RESULT } as JobResult,
     uploadProgress: 0,
     uploading: false,
@@ -25,6 +27,7 @@ export const useJobStore = defineStore('job', {
       try {
         this.config = await api.getConfig()
         await this.restore()
+        await this.loadHistory()
       } catch (error) {
         this.error = apiError(error)
       }
@@ -33,6 +36,7 @@ export const useJobStore = defineStore('job', {
       try {
         const job = await api.getCurrentJob()
         this.job = job
+        this.currentJobId = job.job_id
         sessionStorage.setItem('current_job_id', job.job_id)
         if (job.progress >= 40 || job.status === 'ready') await this.loadResult(job.job_id)
         if (job.status === 'running') this.schedulePoll()
@@ -44,7 +48,7 @@ export const useJobStore = defineStore('job', {
         throw error
       }
     },
-    async createJob(mcap: File, robotConfig: File) {
+    async createJob(mcaps: File[], robotConfig: File) {
       this.stopPolling()
       this.uploading = true
       this.uploadProgress = 0
@@ -52,9 +56,10 @@ export const useJobStore = defineStore('job', {
       this.uploadController = new AbortController()
       try {
         const job = await api.createJob(
-          mcap, robotConfig, value => { this.uploadProgress = value }, this.uploadController.signal,
+          mcaps, robotConfig, value => { this.uploadProgress = value }, this.uploadController.signal,
         )
         this.job = job
+        this.currentJobId = job.job_id
         this.result = { ...EMPTY_RESULT, job_id: job.job_id }
         sessionStorage.setItem('current_job_id', job.job_id)
       } catch (error) {
@@ -90,6 +95,7 @@ export const useJobStore = defineStore('job', {
         this.failureCount = 0
         if (job.progress >= 40 || job.status === 'ready') await this.loadResult(expected)
         if (job.status === 'running') this.schedulePoll()
+        if (job.status === 'ready') await this.loadHistory()
       } catch (error) {
         this.failureCount += 1
         this.error = apiError(error)
@@ -111,6 +117,16 @@ export const useJobStore = defineStore('job', {
       const result = await api.getResult(expected)
       if (this.job?.job_id === expected) this.result = result
     },
+    async loadHistory() {
+      this.history = await api.getJobHistory()
+    },
+    async selectJob(jobId: string) {
+      this.stopPolling()
+      this.error = ''
+      this.job = await api.getJob(jobId)
+      await this.loadResult(jobId)
+      sessionStorage.setItem('current_job_id', jobId)
+    },
     async patchEvent(eventId: string, patch: EventPatch) {
       if (!this.job) return
       const updated = await api.updateEvent(this.job.job_id, eventId, patch)
@@ -126,7 +142,9 @@ export const useJobStore = defineStore('job', {
       await api.deleteJob(this.job.job_id)
       this.stopPolling()
       this.job = null
+      this.currentJobId = ''
       this.result = { ...EMPTY_RESULT }
+      await this.loadHistory()
       sessionStorage.removeItem('current_job_id')
     },
   },

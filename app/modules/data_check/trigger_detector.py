@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -9,6 +10,9 @@ import numpy as np
 import ruptures as rpt
 from scipy.cluster.vq import kmeans2
 from scipy.signal import savgol_filter
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class EndEffectorTriggerDetector:
@@ -148,6 +152,37 @@ class EndEffectorTriggerDetector:
         ]
         if matched:
             return matched
+        wildcard_matched = [
+            {"key": str(camera["key"]), "topic": str(camera["topic"])}
+            for camera in cameras
+            if str(camera.get("group", "")).strip().lower() in {"all", "*"}
+        ]
+        if wildcard_matched:
+            LOGGER.info(
+                "trigger_detector_camera_group_wildcard state_key=%s state_topic=%s state_group=%s cameras=%s",
+                state_schema.get("key"),
+                state_schema.get("topic"),
+                state_schema.get("group"),
+                wildcard_matched,
+            )
+            return wildcard_matched
+        LOGGER.warning(
+            "trigger_detector_camera_group_missing state_key=%s state_topic=%s state_group=%s "
+            "available_cameras=%s fallback_topic_key=%s",
+            state_schema.get("key"),
+            state_schema.get("topic"),
+            state_schema.get("group"),
+            [
+                {
+                    "key": camera.get("key"),
+                    "topic": camera.get("topic"),
+                    "group": camera.get("group"),
+                }
+                for camera in cameras
+                if isinstance(camera, dict)
+            ],
+            state_schema.get("key"),
+        )
         return [{"key": str(state_schema["key"]), "topic": str(state_schema.get("topic", ""))}]
 
     def _smooth(self, values: np.ndarray, config: dict[str, Any]) -> np.ndarray:

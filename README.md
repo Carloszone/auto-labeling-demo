@@ -1,6 +1,6 @@
 # MCAP 自动质检与标注 Demo
 
-本项目提供 Vue 3 前端和 FastAPI 后端，用于上传单个 MCAP 与 robot config、运行现有自动标注算法、同步播放多摄像头视频、复核 Event 并导出 JSON。Demo 使用单工作项和本地临时目录，不依赖数据库、S3 或任务队列。
+本项目提供 Vue 3 前端和 FastAPI 后端，用于上传一组属于同一连续任务的 MCAP 与 robot config、运行现有自动标注算法、同步播放多摄像头视频、复核 Event/异常并导出 JSON。Demo 使用一个当前工作项和最近 5 个成功工作项的进程内历史记录，文件保存在本地临时目录，不依赖数据库、S3 或任务队列。
 
 ## 环境准备
 
@@ -90,7 +90,7 @@ tail -f logs/auto-labeling-demo.log
 - `AUTO_LABEL_PORT`：默认 `8000`。
 - `AUTO_LABEL_WORKSPACE_ROOT`：默认 `/tmp/auto-labeling-demo`。
 - `AUTO_LABEL_VLM_ENDPOINT`：VLM HTTP 地址；生成 Event 后调用 VLM 时必需。
-- `AUTO_LABEL_VLM_TIMEOUT_SEC`：单个 VLM 请求超时，默认 120 秒。
+- `AUTO_LABEL_VLM_TIMEOUT_SEC`：单个 VLM 请求超时，默认 300 秒。
 
 后端启动时自动读取项目根目录 `.env`。已经由终端、systemd 或容器注入的同名环境变量优先，不会被 `.env` 覆盖。可用 `AUTO_LABEL_ENV_FILE` 指定其他配置文件。数据库密码、S3 密钥等未来配置只写入部署主机的 `.env` 或密钥管理服务，不应提交到 Git；`.env.example` 只保存字段名和非敏感示例。
 

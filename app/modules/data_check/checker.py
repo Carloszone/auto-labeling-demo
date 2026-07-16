@@ -238,6 +238,11 @@ class DataChecker:
             lap_history: list[float] = []
             for index, row in enumerate(image_list):
                 image = row.get(camera_key)
+                if image and image.get("alignment_filled"):
+                    # A repeated frame represents a small MCAP boundary gap, not
+                    # an observed still/blur condition. Keep the last genuine
+                    # frame as comparison context and exclude the synthetic one.
+                    continue
                 frame = self._decode_image(image) if image else None
                 if frame is None:
                     self._add_detail(detail, index, "corrupted", camera_key, str((image or {}).get("decode_error", "decode failed")))
