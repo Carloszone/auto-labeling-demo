@@ -151,7 +151,7 @@ class AutoLabelingService:
         }
         config["vlm_params"] = _deep_merge(config["vlm_params"], non_empty_legacy_vlm)
         for key, fallback in {
-            "model": "qwen/qwen3.5-9b",
+            "model": EVENT_LABELING_DEFAULTS["vlm_params"]["model"],
             "system_prompt": DEFAULT_SYSTEM_PROMPT,
             "input_prompt": DEFAULT_INPUT_PROMPT,
         }.items():

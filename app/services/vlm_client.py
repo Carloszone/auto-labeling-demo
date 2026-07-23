@@ -25,13 +25,28 @@ class HttpVlmClient:
         self.endpoint = endpoint
         self.timeout_sec = timeout_sec
 
-    def label(self, *, model: str, system_prompt: str, input_prompt: str, samples: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    def label(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        input_prompt: str,
+        samples: dict[str, list[dict[str, Any]]],
+        store: bool = False,
+        reasoning: str = "off",
+        temperature: float = 0.7,
+        max_output_tokens: int = 1024,
+    ) -> dict[str, Any]:
         """Send sampled frames to VLM and return action_summary/action_state/details."""
 
         payload = {
             "model": model,
             "system_prompt": system_prompt,
             "input": self._build_input(input_prompt, samples),
+            "store": store,
+            "reasoning": reasoning,
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
         }
         encoded_payload = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
@@ -42,8 +57,10 @@ class HttpVlmClient:
         )
         started = time.perf_counter()
         LOGGER.info(
-            "vlm_http_request endpoint=%s model=%s image_count=%s timeout_sec=%s",
+            "vlm_http_request endpoint=%s model=%s image_count=%s timeout_sec=%s "
+            "store=%s reasoning=%s temperature=%s max_output_tokens=%s",
             self.endpoint, model, sum(len(items) for items in samples.values()), self.timeout_sec,
+            store, reasoning, temperature, max_output_tokens,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_sec) as response:
@@ -76,7 +93,30 @@ class HttpVlmClient:
             "vlm_http_response endpoint=%s model=%s duration_sec=%.6f raw_response=%r",
             self.endpoint, model, time.perf_counter() - started, raw_response[:20000],
         )
-        return self._parse_response(raw_response)
+        try:
+            return self._parse_response(raw_response)
+        except Exception as exc:
+            exc.vlm_raw_response = raw_response[:MAX_ERROR_BODY_CHARS]
+            exc.vlm_model_content = self._diagnostic_model_content(raw_response)[:MAX_ERROR_BODY_CHARS]
+            LOGGER.exception(
+                "vlm_response_parse_failed endpoint=%s model=%s raw_response=%r",
+                self.endpoint,
+                model,
+                raw_response[:MAX_ERROR_BODY_CHARS],
+            )
+            raise
+
+    def _diagnostic_model_content(self, raw_response: str) -> str:
+        """Prefer the model message over an envelope so failed annotations show the useful output."""
+
+        try:
+            data = json.loads(raw_response)
+            content = self._extract_content(data)
+            if isinstance(content, str):
+                return content
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return raw_response
 
     def _build_input(self, input_prompt: str, samples: dict[str, list[dict[str, Any]]]) -> list[dict[str, str]]:
         """Build the mixed text/image input list expected by the VLM service."""

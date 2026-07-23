@@ -8,6 +8,10 @@ import time
 import urllib.error
 from typing import Any, Callable, Protocol
 
+import cv2
+
+from app.core.video_frames import read_video_frames
+
 
 LOGGER = logging.getLogger(__name__)
 MAX_EVENT_FRAME_LEN = 20
@@ -16,7 +20,18 @@ MAX_EVENT_FRAME_LEN = 20
 class VlmClientProtocol(Protocol):
     """Protocol implemented by VLM clients used by EventLabeler."""
 
-    def label(self, *, model: str, system_prompt: str, input_prompt: str, samples: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    def label(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        input_prompt: str,
+        samples: dict[str, list[dict[str, Any]]],
+        store: bool = False,
+        reasoning: str = "off",
+        temperature: float = 0.7,
+        max_output_tokens: int = 1024,
+    ) -> dict[str, Any]:
         """Return one structured VLM label for sampled event frames."""
 
 
@@ -52,10 +67,26 @@ class EventLabeler:
             raise ValueError("parser_info and generation_info are required")
         if not isinstance(parser_info.get("timestamp_list"), list) or not parser_info["timestamp_list"]:
             raise ValueError("parser_info.timestamp_list must be a non-empty list")
-        if not isinstance(parser_info.get("image_list"), list) or len(parser_info["image_list"]) != len(parser_info["timestamp_list"]):
+        has_images = isinstance(parser_info.get("image_list"), list)
+        has_videos = isinstance(parser_info.get("video_paths"), dict) and bool(parser_info["video_paths"])
+        if not has_images and not has_videos:
+            raise ValueError("parser_info requires image_list or video_paths")
+        if has_images and len(parser_info["image_list"]) != len(parser_info["timestamp_list"]):
             raise ValueError("parser_info.image_list must align with timestamp_list")
         if not vlm_params.get("model"):
             raise ValueError("vlm_params.model is required")
+        store = vlm_params.get("store", False)
+        reasoning = str(vlm_params.get("reasoning", "off"))
+        temperature = float(vlm_params.get("temperature", 0.7))
+        max_output_tokens = int(vlm_params.get("max_output_tokens", 1024))
+        if not isinstance(store, bool):
+            raise ValueError("vlm_params.store must be a boolean")
+        if reasoning not in {"off", "on"}:
+            raise ValueError("vlm_params.reasoning must be off or on")
+        if not 0 <= temperature <= 2:
+            raise ValueError("vlm_params.temperature must be between 0 and 2")
+        if max_output_tokens <= 0:
+            raise ValueError("vlm_params.max_output_tokens must be positive")
 
         event_periods = generation_info.get("event_periods")
         if not isinstance(event_periods, dict):
@@ -63,7 +94,7 @@ class EventLabeler:
         if not event_periods:
             return {"task_id": task_id, "job_id": basic.get("job_id"), "response": []}
 
-        fixed_frame_len, context_frame_len = self._sampling_lengths(sampling)
+        fixed_frame_len, sampling_frame_gap, context_frame_len = self._sampling_lengths(sampling)
         flattened = [period for topic_periods in event_periods.values() for period in topic_periods]
         flattened.sort(key=lambda period: (int(period["start_index"]), str(period["topic_key"])))
         periods = self._validated_periods(parser_info["timestamp_list"], flattened)
@@ -77,12 +108,14 @@ class EventLabeler:
             topic_key = str(period.get("topic_key", ""))
             if not topic_key:
                 raise ValueError("event period topic_key is required")
+            sample_source = parser_info.get("image_list") if has_images else parser_info["video_paths"]
             samples = self._sample_images(
-                parser_info["image_list"],
+                sample_source,
                 parser_info["timestamp_list"],
                 period["start_index"],
                 period["end_index"],
                 fixed_frame_len,
+                sampling_frame_gap,
                 context_frame_len,
                 topic_key,
                 context={
@@ -110,7 +143,8 @@ class EventLabeler:
             LOGGER.info(
                 "VLM sampling task_id=%s job_id=%s topic_key=%s start_index=%s end_index=%s "
                 "event_source_frames=%s event_sample_frames=%s context_before_frames=%s "
-                "context_after_frames=%s max_event_frames=%s",
+                "context_after_frames=%s requested_sampling_frame_gap=%s "
+                "effective_sampling_frame_gap=%s max_event_frames=%s",
                 task_id,
                 job_id,
                 topic_key,
@@ -120,6 +154,12 @@ class EventLabeler:
                 sum(item["sample_role"] == "event" for item in topic_samples),
                 sum(item["sample_role"] == "context_before" for item in topic_samples),
                 sum(item["sample_role"] == "context_after" for item in topic_samples),
+                sampling_frame_gap,
+                self._effective_sampling_gap(
+                    int(period["end_index"]) - int(period["start_index"]) + 1,
+                    sampling_frame_gap,
+                    min(fixed_frame_len, MAX_EVENT_FRAME_LEN),
+                ),
                 MAX_EVENT_FRAME_LEN,
             )
             LOGGER.info(
@@ -135,6 +175,10 @@ class EventLabeler:
                     system_prompt=str(vlm_params.get("system_prompt", "")),
                     input_prompt=str(vlm_params.get("input_prompt", "")),
                     samples=samples,
+                    store=store,
+                    reasoning=reasoning,
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
                 )
             except Exception as exc:
                 LOGGER.exception(
@@ -180,7 +224,14 @@ class EventLabeler:
             body = str(getattr(exc, "vlm_error_body", ""))
             suffix = f"；服务端响应：{body}" if body else ""
             return f"VLM服务返回HTTP {exc.code} {exc.reason}{suffix}"[:4000]
-        return f"{type(exc).__name__}: {exc}"[:4000]
+        detail = f"{type(exc).__name__}: {exc}"
+        raw_output = str(
+            getattr(exc, "vlm_model_content", "")
+            or getattr(exc, "vlm_raw_response", "")
+        )
+        if raw_output:
+            detail += f"；模型原始返回：{raw_output}"
+        return detail[:4000]
 
     def _validated_periods(
         self, timestamps: list[dict[str, str]], periods: list[dict[str, Any]]
@@ -210,27 +261,31 @@ class EventLabeler:
             previous_start = start
         return validated
 
-    def _sampling_lengths(self, sampling: dict[str, Any]) -> tuple[int, int]:
-        """Extract event and per-side context sampling lengths in frames."""
+    def _sampling_lengths(self, sampling: dict[str, Any]) -> tuple[int, int, int]:
+        """Extract the event cap, sampling gap, and per-side context length."""
 
         if sampling.get("mode") != "fixed_sequence":
             raise ValueError("only fixed_sequence sampling is supported")
         params = sampling.get("params", {})
         fixed_frame_len = params.get("fixed_frame_len")
+        sampling_frame_gap = params.get("sampling_frame_gap", 20)
         context_frame_len = params.get("context_frame_len", 2)
         if not isinstance(fixed_frame_len, int) or fixed_frame_len <= 0:
             raise ValueError("sampling.params.fixed_frame_len must be a positive integer")
+        if not isinstance(sampling_frame_gap, int) or sampling_frame_gap <= 0:
+            raise ValueError("sampling.params.sampling_frame_gap must be a positive integer")
         if not isinstance(context_frame_len, int) or context_frame_len < 0:
             raise ValueError("sampling.params.context_frame_len must be a non-negative integer")
-        return fixed_frame_len, context_frame_len
+        return fixed_frame_len, sampling_frame_gap, context_frame_len
 
     def _sample_images(
         self,
-        image_list: list[dict[str, Any]],
+        image_list: list[dict[str, Any]] | dict[str, str],
         timestamps: list[dict[str, str]],
         start_index: int,
         end_index: int,
         fixed_frame_len: int,
+        sampling_frame_gap: int,
         context_frame_len: int,
         topic_key: str,
         context: dict[str, Any] | None = None,
@@ -239,9 +294,12 @@ class EventLabeler:
 
         before = range(max(0, start_index - context_frame_len), start_index)
         event = self._sample_indexes(
-            start_index, end_index, min(fixed_frame_len, MAX_EVENT_FRAME_LEN)
+            start_index,
+            end_index,
+            min(fixed_frame_len, MAX_EVENT_FRAME_LEN),
+            sampling_frame_gap,
         )
-        after = range(end_index + 1, min(len(image_list), end_index + 1 + context_frame_len))
+        after = range(end_index + 1, min(len(timestamps), end_index + 1 + context_frame_len))
         indexed_roles = (
             [(index, "context_before") for index in before]
             + [(index, "event") for index in event]
@@ -251,6 +309,30 @@ class EventLabeler:
         if ordered_indexes != sorted(ordered_indexes) or len(ordered_indexes) != len(set(ordered_indexes)):
             raise ValueError("sample images must be unique and ordered chronologically")
         samples: dict[str, list[dict[str, Any]]] = {}
+        if isinstance(image_list, dict):
+            video_path = image_list.get(topic_key)
+            if not video_path:
+                raise ValueError(f"sample video topic is missing: {topic_key}")
+            decoded = read_video_frames(video_path, ordered_indexes)
+            for frame_index, sample_role in indexed_roles:
+                frame = decoded[frame_index]
+                ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+                if not ok:
+                    raise ValueError(f"failed to encode sampled video frame: {frame_index}")
+                samples.setdefault(topic_key, []).append({
+                    "frame_index": frame_index,
+                    "sample_role": sample_role,
+                    "image_base64": base64.b64encode(encoded.tobytes()).decode("ascii"),
+                    "encoding": "bgr8",
+                    "source_topic": next((
+                        str(item.get("topic", "")) for item in (context or {}).get("camera_schema", [])
+                        if item.get("key") == topic_key
+                    ), ""),
+                    "format": "jpeg",
+                    "timestamp_ns": timestamps[frame_index]["timestamp_ns"],
+                    "timestamp_sec": timestamps[frame_index]["timestamp_sec"],
+                })
+            return samples
         for frame_index, sample_role in indexed_roles:
             frame_images = image_list[frame_index]
             image = frame_images.get(topic_key)
@@ -346,18 +428,31 @@ class EventLabeler:
             raise ValueError("no image samples were generated")
         return samples
 
-    def _sample_indexes(self, start_index: int, end_index: int, fixed_frame_len: int) -> list[int]:
-        """Return deterministic frame indexes for fixed-sequence sampling."""
+    def _sample_indexes(
+        self,
+        start_index: int,
+        end_index: int,
+        fixed_frame_len: int,
+        sampling_frame_gap: int,
+    ) -> list[int]:
+        """Sample by the requested frame gap, enlarging it when the cap would be exceeded."""
 
         count = end_index - start_index + 1
-        if count <= fixed_frame_len:
-            return list(range(start_index, end_index + 1))
-        if fixed_frame_len == 1:
-            return [start_index]
-        return [
-            start_index + round(i * (count - 1) / (fixed_frame_len - 1))
-            for i in range(fixed_frame_len)
-        ]
+        effective_gap = self._effective_sampling_gap(
+            count, sampling_frame_gap, fixed_frame_len
+        )
+        return list(range(start_index, end_index + 1, effective_gap))
+
+    @staticmethod
+    def _effective_sampling_gap(
+        frame_count: int, sampling_frame_gap: int, fixed_frame_len: int
+    ) -> int:
+        """Return the requested gap or the minimum larger gap required by the image cap."""
+
+        requested_count = (frame_count + sampling_frame_gap - 1) // sampling_frame_gap
+        if requested_count <= fixed_frame_len:
+            return sampling_frame_gap
+        return (frame_count + fixed_frame_len - 1) // fixed_frame_len
 
     def _format_annotation(
         self,

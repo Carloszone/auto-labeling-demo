@@ -5,20 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pickle
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
-from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
-import av
-import cv2
-import numpy as np
 from fastapi import UploadFile
 
 from app.core.config import load_robot_config
@@ -91,7 +90,47 @@ class JobService:
             elif child.suffix == ".part":
                 child.unlink(missing_ok=True)
 
-    async def create_job(self, mcaps: list[UploadFile], robot_config: UploadFile) -> dict[str, Any]:
+    def new_job(self) -> dict[str, Any]:
+        """Archive the completed current job and open an empty upload workspace."""
+
+        with self._lock:
+            if self._job and self._job["status"] == "running":
+                raise ApiError(409, "JOB_RUNNING", "当前工作项正在运行，不能新建工作项")
+            self._rotate_current_locked()
+            self._job = self._new_draft_locked()
+            LOGGER.info("job_draft_created job_id=%s", self._job["job_id"])
+            return self.summary(self._job["job_id"])
+
+    def _new_draft_locked(self) -> dict[str, Any]:
+        """Create one empty current job; caller must hold the service lock."""
+
+        free_bytes = shutil.disk_usage(self.settings.workspace_root).free
+        if free_bytes < self.settings.min_free_bytes:
+            raise ApiError(507, "INSUFFICIENT_STORAGE", "临时目录可用空间不足 6 GiB")
+        job_id = f"job{self._ids.next_id()}"
+        workspace = self.settings.workspace_root / job_id
+        for folder in ("input", "config", "videos", "metadata", "annotations", "export"):
+            (workspace / folder).mkdir(parents=True, exist_ok=True)
+        now = _utc_now()
+        return {
+            "job_id": job_id, "file_name": "", "file_names": [], "mcap_count": 0,
+            "file_size_bytes": 0, "workspace_path": workspace,
+            "mcap_path": workspace / "input" / "segment_000.mcap", "mcap_paths": [],
+            "segment_manifest": [], "robot_config_path": workspace / "config" / "robot.json",
+            "status": "draft", "stage": "draft", "progress": 0,
+            "message": "请选择 MCAP 和 Robot Config", "error": None, "warnings": [],
+            "effective_config": {}, "input_prompt": "", "duration_sec": None,
+            "main_camera_key": None, "cameras": [], "events": [],
+            "raw_result": {"task_id": job_id, "job_id": job_id, "response": []},
+            "data_anomaly_ranges": [], "image_anomaly_ranges": [], "timeline_ns": [],
+            "vlm_completed_count": 0, "vlm_total_count": 0,
+            "created_at": now, "completed_at": None, "updated_at": now,
+            "available_camera_topics": [], "main_time_topic": None,
+        }
+
+    async def create_job(
+        self, mcaps: list[UploadFile], robot_config: UploadFile, draft_job_id: str | None = None
+    ) -> dict[str, Any]:
         """Stream an MCAP set plus robot JSON to a new workspace."""
 
         if len(mcaps) > int(MULTI_MCAP_POLICY["max_segment_count"]):
@@ -100,54 +139,22 @@ class JobService:
         with self._lock:
             if self._job and self._job["status"] == "running":
                 raise ApiError(409, "JOB_RUNNING", "当前工作项正在运行，不能创建新工作项")
-            self._rotate_current_locked()
-            free_bytes = shutil.disk_usage(self.settings.workspace_root).free
-            if free_bytes < self.settings.min_free_bytes:
-                raise ApiError(507, "INSUFFICIENT_STORAGE", "临时目录可用空间不足 6 GiB")
-            job_id = f"job{self._ids.next_id()}"
-            workspace = self.settings.workspace_root / job_id
-            (workspace / "input").mkdir(parents=True)
-            (workspace / "config").mkdir()
-            (workspace / "videos").mkdir()
-            (workspace / "metadata").mkdir()
-            (workspace / "annotations").mkdir()
-            (workspace / "export").mkdir()
-            now = _utc_now()
-            self._job = {
-                "job_id": job_id,
+            if draft_job_id:
+                if not self._job or self._job["job_id"] != draft_job_id or self._job["status"] != "draft":
+                    raise ApiError(409, "INVALID_JOB_STATE", "目标工作项不是当前待上传工作项")
+            else:
+                self._rotate_current_locked()
+                self._job = self._new_draft_locked()
+            job_id = self._job["job_id"]
+            workspace = self._job["workspace_path"]
+            mcap_paths = [workspace / "input" / f"segment_{index:03d}.mcap" for index in range(len(mcaps))]
+            self._job.update({
                 "file_name": Path(mcaps[0].filename or "source.mcap").name,
                 "file_names": [Path(item.filename or f"segment_{index:03d}.mcap").name for index, item in enumerate(mcaps)],
-                "mcap_count": len(mcaps),
-                "file_size_bytes": 0,
-                "workspace_path": workspace,
-                "mcap_path": workspace / "input" / "segment_000.mcap",
-                "mcap_paths": [workspace / "input" / f"segment_{index:03d}.mcap" for index in range(len(mcaps))],
-                "segment_manifest": [],
-                "robot_config_path": workspace / "config" / "robot.json",
-                "status": "validating",
-                "stage": "validating",
-                "progress": 0,
-                "message": "正在上传文件",
-                "error": None,
-                "warnings": [],
-                "effective_config": {},
-                "input_prompt": "",
-                "duration_sec": None,
-                "main_camera_key": None,
-                "cameras": [],
-                "events": [],
-                "raw_result": {"task_id": job_id, "job_id": job_id, "response": []},
-                "data_anomaly_ranges": [],
-                "image_anomaly_ranges": [],
-                "timeline_ns": [],
-                "vlm_completed_count": 0,
-                "vlm_total_count": 0,
-                "created_at": now,
-                "completed_at": None,
-                "updated_at": now,
-                "available_camera_topics": [],
-                "main_time_topic": None,
-            }
+                "mcap_count": len(mcaps), "mcap_path": mcap_paths[0], "mcap_paths": mcap_paths,
+                "status": "validating", "stage": "validating", "message": "正在上传文件",
+                "updated_at": _utc_now(),
+            })
 
         try:
             size = 0
@@ -194,7 +201,17 @@ class JobService:
                 return self.summary(job_id)
         except Exception:
             with self._lock:
-                self._delete_current_locked()
+                if draft_job_id and self._job and self._job["job_id"] == draft_job_id:
+                    for path in self._job["workspace_path"].joinpath("input").glob("*"):
+                        path.unlink(missing_ok=True)
+                    self._job.update({
+                        "file_name": "", "file_names": [], "mcap_count": 0,
+                        "file_size_bytes": 0, "mcap_paths": [], "status": "draft",
+                        "stage": "draft", "progress": 0,
+                        "message": "上传失败，请重新选择文件", "updated_at": _utc_now(),
+                    })
+                else:
+                    self._delete_current_locked()
             raise
         finally:
             for upload in mcaps:
@@ -281,17 +298,17 @@ class JobService:
                 robot.main_time_topic = str(main_topic)
             self._update(job_id, main_time_topic=robot.main_time_topic)
 
-            self._set_stage(job_id, "parsing", 5, "正在解析和对齐 MCAP")
-            parser_request = self._pipeline._parser_request(
-                job_id, job_id, mcap_paths[0], robot, None, request.parser_config
-            )
-            parser_request["parser"]["mcap_paths"] = mcap_paths
-            with self._timed(job_id, "parser"):
-                parser_info = self._pipeline.parser.parse(parser_request)
+            self._set_stage(job_id, "parsing", 5, "正在独立进程解析 MCAP 并生成视频")
+            with self._timed(job_id, "parser_video_worker"):
+                artifacts = self._run_artifact_worker(
+                    job_id, workspace, mcap_paths, robot_path, robot.main_time_topic,
+                    request.parser_config,
+                )
+            parser_info = artifacts["parser_info"]
             self._atomic_json(workspace / "metadata" / "segments.json", parser_info.get("segment_manifest", []))
             self._atomic_json(workspace / "metadata" / "frames.json", parser_info.get("frame_manifest", []))
-            timestamps_ns = [int(item["timestamp_ns"]) for item in parser_info["timestamp_list"]]
-            duration = max(0.0, (timestamps_ns[-1] - timestamps_ns[0]) / 1e9)
+            timestamps_ns = list(artifacts["timestamps_ns"])
+            duration = float(artifacts["duration_sec"])
             LOGGER.info(
                 "parser_output job_id=%s aligned_frames=%s duration_sec=%.9f main_camera_key=%s state_topics=%s action_topics=%s",
                 job_id, len(timestamps_ns), duration, parser_info["main_time_camera_key"],
@@ -304,10 +321,14 @@ class JobService:
             self._update(job_id, timeline_ns=timestamps_ns, duration_sec=duration, main_camera_key=parser_info["main_time_camera_key"])
             self._update(job_id, segment_manifest=deepcopy(parser_info.get("segment_manifest", [])))
 
-            self._set_stage(job_id, "video_generating", 25, "正在生成摄像头视频")
-            with self._timed(job_id, "video_generation"):
-                cameras, warnings = self._generate_videos(job_id, workspace, parser_info, robot, duration)
+            self._set_stage(job_id, "video_generating", 25, "摄像头视频已由独立进程生成")
+            cameras = artifacts["cameras"]
+            warnings = artifacts["warnings"]
             self._update(job_id, cameras=cameras, warnings=warnings)
+            LOGGER.info(
+                "artifact_worker_memory_released job_id=%s video_camera_count=%s",
+                job_id, len(parser_info["video_paths"]),
+            )
 
             self._set_stage(job_id, "data_checking", 40, "正在进行数据和图像质检")
             check_config = self._pipeline._data_check_config(request.data_check_config)
@@ -413,80 +434,47 @@ class JobService:
             job_id, module, time.perf_counter() - started,
         )
 
-    def _generate_videos(
-        self, job_id: str, workspace: Path, parser_info: dict[str, Any], robot: Any, duration: float
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        cameras: list[dict[str, Any]] = []
-        warnings: list[dict[str, Any]] = []
-        candidates = [camera for camera in robot.cameras if camera.output_video] or list(robot.cameras)
-        main_key = parser_info["main_time_camera_key"]
-        for index, camera in enumerate(candidates, start=1):
-            target = workspace / "videos" / f"{camera.name}.mp4"
-            try:
-                self._encode_camera(parser_info["image_list"], camera.name, target)
-                cameras.append({
-                    "camera_key": camera.name,
-                    "source_topic": camera.topic,
-                    "video_url": f"/api/v1/jobs/{job_id}/videos/{camera.name}",
-                    "duration_sec": duration,
-                    "is_main_camera": camera.name == main_key,
-                    "generation_status": "ready",
-                    "error": None,
-                })
-            except Exception as exc:
-                if camera.name == main_key:
-                    raise RuntimeError(f"主摄像头视频生成失败 ({camera.name}): {exc}") from exc
-                warning = {"code": "SECONDARY_VIDEO_FAILED", "camera_key": camera.name, "message": str(exc)}
-                warnings.append(warning)
-                cameras.append({
-                    "camera_key": camera.name, "source_topic": camera.topic, "video_url": None,
-                    "duration_sec": duration, "is_main_camera": False,
-                    "generation_status": "failed", "error": warning,
-                })
-            self._update(job_id, progress=25 + int(15 * index / max(len(candidates), 1)))
-        return cameras, warnings
+    def _run_artifact_worker(
+        self, job_id: str, workspace: Path, mcap_paths: list[Path], robot_path: Path,
+        main_time_topic: str, parser_config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Run the image-heavy stages out of process and load only compact artifacts."""
 
-    def _encode_camera(self, image_list: list[dict[str, Any]], camera_key: str, target: Path) -> None:
-        if not image_list:
-            raise ValueError("没有可编码图像")
-        first = self._decode_frame(image_list[0], camera_key)
-        height, width = first.shape[:2]
-        even_width, even_height = width + width % 2, height + height % 2
-        part = target.with_suffix(".mp4.part")
-        container = av.open(str(part), mode="w", format="mp4", options={"movflags": "+faststart"})
-        try:
-            stream = container.add_stream("libx264", rate=30)
-            stream.width = even_width
-            stream.height = even_height
-            stream.pix_fmt = "yuv420p"
-            stream.options = {"preset": "veryfast", "crf": "23"}
-            for index, row in enumerate(image_list):
-                frame = first if index == 0 else self._decode_frame(row, camera_key)
-                if frame.shape[1] != even_width or frame.shape[0] != even_height:
-                    frame = cv2.copyMakeBorder(
-                        frame, 0, even_height - frame.shape[0], 0, even_width - frame.shape[1],
-                        cv2.BORDER_CONSTANT,
-                    )
-                video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
-                video_frame.pts = index
-                video_frame.time_base = Fraction(1, 30)
-                for packet in stream.encode(video_frame):
-                    container.mux(packet)
-            for packet in stream.encode():
-                container.mux(packet)
-        finally:
-            container.close()
-        os.replace(part, target)
-
-    def _decode_frame(self, row: dict[str, Any], camera_key: str) -> np.ndarray:
-        image = row.get(camera_key)
-        if not image or image.get("raw") is None:
-            raise ValueError("缺少对齐图像")
-        raw = np.frombuffer(bytes(image["raw"]), dtype=np.uint8)
-        frame = cv2.imdecode(raw, cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError("无法解码图像")
-        return frame
+        request_path = workspace / "metadata" / "artifact_worker_request.json"
+        output_path = workspace / "metadata" / "parser_compact.pkl"
+        self._atomic_json(request_path, {
+            "job_id": job_id,
+            "workspace": str(workspace),
+            "mcap_paths": [str(path) for path in mcap_paths],
+            "robot_config_path": str(robot_path),
+            "main_time_topic": main_time_topic,
+            "parser_config": parser_config,
+            "max_frames": None,
+        })
+        output_path.unlink(missing_ok=True)
+        command = [
+            sys.executable, "-m", "backend.artifact_worker",
+            "--request", str(request_path), "--output", str(output_path),
+        ]
+        completed = subprocess.run(
+            command, cwd=str(Path(__file__).resolve().parents[1]),
+            capture_output=True, text=True, check=False,
+        )
+        if completed.stdout:
+            LOGGER.info("artifact_worker_stdout job_id=%s output=%s", job_id, completed.stdout[-4000:])
+        if completed.returncode != 0:
+            detail = completed.stderr[-8000:] if completed.stderr else "no stderr"
+            raise RuntimeError(
+                f"Parser/视频独立进程失败，exit_code={completed.returncode}: {detail}"
+            )
+        if not output_path.is_file():
+            raise RuntimeError("Parser/视频独立进程未生成紧凑结果")
+        with output_path.open("rb") as stream:
+            result = pickle.load(stream)
+        parser_info = result.get("parser_info") if isinstance(result, dict) else None
+        if not isinstance(parser_info, dict) or "image_list" in parser_info:
+            raise RuntimeError("Parser/视频独立进程返回了无效或包含图像的结果")
+        return result
 
     def summary(self, job_id: str) -> dict[str, Any]:
         with self._lock:
@@ -694,6 +682,8 @@ class JobService:
         return {
             "id": str(raw["id"]), "topic_key": str(raw.get("topic_key", "")),
             "source_topic": str(raw.get("source_topic", "")),
+            "trigger_topic_key": str(raw.get("trigger_topic_key", raw.get("topic_key", ""))),
+            "trigger_source_topic": str(raw.get("trigger_source_topic", raw.get("source_topic", ""))),
             "start_sec": float(raw.get("timeline_start_sec", raw.get("episode_start_time", raw.get("startSec", 0)))),
             "end_sec": float(raw.get("timeline_end_sec", raw.get("episode_end_time", raw.get("endSec", 0)))),
             "prompt": str(raw.get("prompt", "")), "description": str(raw.get("description", "")),

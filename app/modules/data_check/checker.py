@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 from scipy.signal import savgol_filter
 
+from app.core.video_frames import iter_video_frames
 from app.modules.data_check.trigger_detector import EndEffectorTriggerDetector
 
 
@@ -70,7 +71,10 @@ class DataChecker:
                 self._detect_extremes(metrics, extreme, data_detail)
                 self._detect_zero_speed(metrics, extreme, data_detail)
         if image_config.get("enable", False):
-            self._detect_images(parser_info["image_list"], image_config, fps, float(basic.get("eps", 1e-9)), image_detail)
+            if parser_info.get("video_paths"):
+                self._detect_video_images(parser_info, image_config, fps, float(basic.get("eps", 1e-9)), image_detail)
+            else:
+                self._detect_images(parser_info["image_list"], image_config, fps, float(basic.get("eps", 1e-9)), image_detail)
 
         all_detail = self._combine_details(data_detail, image_detail)
         timestamps = parser_info["timestamp_list"]
@@ -88,16 +92,20 @@ class DataChecker:
     def _validate_parser_info(self, parser_info: dict[str, Any]) -> None:
         """Validate parallel aligned lists, monotonic timestamps, and declared state keys."""
 
-        required = {"timestamp_list", "image_list", "state_list", "action_list", "state_schema", "action_schema"}
+        required = {"timestamp_list", "state_list", "action_list", "state_schema", "action_schema"}
         missing = sorted(required - set(parser_info))
         if missing:
             raise ValueError(f"parser_info missing fields: {missing}")
         length = len(parser_info["timestamp_list"])
         if length == 0:
             raise ValueError("timestamp_list must not be empty")
-        for key in ("image_list", "state_list", "action_list"):
+        if not isinstance(parser_info.get("image_list"), list) and not parser_info.get("video_paths"):
+            raise ValueError("parser_info requires image_list or video_paths")
+        for key in ("state_list", "action_list"):
             if len(parser_info[key]) != length:
                 raise ValueError(f"{key} length must match timestamp_list")
+        if isinstance(parser_info.get("image_list"), list) and len(parser_info["image_list"]) != length:
+            raise ValueError("image_list length must match timestamp_list")
         timestamps = [int(item["timestamp_ns"]) for item in parser_info["timestamp_list"]]
         if any(left >= right for left, right in zip(timestamps, timestamps[1:])):
             raise ValueError("timestamp_list must be strictly monotonic increasing")
@@ -275,6 +283,63 @@ class DataChecker:
                     if mae <= float(config.get("pixel_mae", 5)) and moving_ratio < float(config.get("moving_area_ratio", 0.05)):
                         self._add_detail(detail, index, "still", camera_key, f"mae={mae:.3f}, moving_ratio={moving_ratio:.4f}")
                 previous_valid = None if has_primary_issue else frame
+
+    def _detect_video_images(
+        self, parser_info: dict[str, Any], config: dict[str, Any], fps: float,
+        eps: float, detail: dict[int, list[dict[str, Any]]],
+    ) -> None:
+        """Run image checks by sequentially decoding the fixed-rate MP4 frame stores."""
+
+        count = len(parser_info["timestamp_list"])
+        frame_manifest = parser_info.get("frame_manifest", [])
+        for camera_key, video_path in sorted(parser_info["video_paths"].items()):
+            previous_valid: np.ndarray | None = None
+            lap_history: list[float] = []
+            for index, frame in iter_video_frames(video_path, count):
+                if index < len(frame_manifest) and frame_manifest[index].get("image_filled"):
+                    continue
+                if frame is None:
+                    self._add_detail(detail, index, "corrupted", camera_key, "video frame decode failed")
+                    previous_valid = None
+                    continue
+                previous_valid = self._inspect_frame(
+                    frame, previous_valid, lap_history, index, camera_key, config, fps, eps, detail
+                )
+
+    def _inspect_frame(
+        self, frame: np.ndarray, previous_valid: np.ndarray | None, lap_history: list[float],
+        index: int, camera_key: str, config: dict[str, Any], fps: float, eps: float,
+        detail: dict[int, list[dict[str, Any]]],
+    ) -> np.ndarray | None:
+        """Inspect one already-decoded video frame and return comparison state."""
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+        target_width = int(config.get("resize_length", gray.shape[1]))
+        target_height = int(config.get("resize_width", gray.shape[0]))
+        resized = cv2.resize(gray, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        has_primary_issue = False
+        if float(np.mean(resized)) < float(config.get("luminance", 10)):
+            self._add_detail(detail, index, "black", camera_key, "mean luminance below threshold")
+            has_primary_issue = True
+        lap = float(cv2.Laplacian(resized, cv2.CV_64F).var())
+        blur = lap < float(config.get("lap_var", 150))
+        window = self._seconds_to_frames(config.get("window_time_sec", 1), fps)
+        if not blur and len(lap_history) >= window:
+            history = np.asarray(lap_history[-window:])
+            blur = (float(np.mean(history)) - lap) / (float(np.std(history)) + eps) > float(config.get("z_score", 2))
+        lap_history.append(lap)
+        if blur:
+            self._add_detail(detail, index, "blur", camera_key, f"laplacian_variance={lap:.3f}")
+            has_primary_issue = True
+        if previous_valid is not None and not has_primary_issue:
+            previous_gray = cv2.cvtColor(previous_valid, cv2.COLOR_BGR2GRAY) if previous_valid.ndim == 3 else previous_valid
+            previous_gray = cv2.resize(previous_gray, (target_width, target_height), interpolation=cv2.INTER_AREA)
+            difference = cv2.absdiff(resized, previous_gray)
+            mae = float(np.mean(difference))
+            moving_ratio = float(np.count_nonzero(difference > max(float(config.get("pixel_mae", 5)), 1.0)) / difference.size)
+            if mae <= float(config.get("pixel_mae", 5)) and moving_ratio < float(config.get("moving_area_ratio", 0.05)):
+                self._add_detail(detail, index, "still", camera_key, f"mae={mae:.3f}, moving_ratio={moving_ratio:.4f}")
+        return None if has_primary_issue else frame
 
     def _decode_image(self, image: dict[str, Any] | None) -> np.ndarray | None:
         """Decode parser JPEG bytes or reconstruct supported raw ROS image bytes."""

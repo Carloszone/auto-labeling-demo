@@ -56,7 +56,8 @@ export const useJobStore = defineStore('job', {
       this.uploadController = new AbortController()
       try {
         const job = await api.createJob(
-          mcaps, robotConfig, value => { this.uploadProgress = value }, this.uploadController.signal,
+          mcaps, robotConfig, this.currentJobId,
+          value => { this.uploadProgress = value }, this.uploadController.signal,
         )
         this.job = job
         this.currentJobId = job.job_id
@@ -69,6 +70,16 @@ export const useJobStore = defineStore('job', {
         this.uploading = false
         this.uploadController = null
       }
+    },
+    async newJob() {
+      this.stopPolling()
+      this.error = ''
+      const job = await api.newJob()
+      this.job = job
+      this.currentJobId = job.job_id
+      this.result = { ...EMPTY_RESULT, job_id: job.job_id }
+      sessionStorage.setItem('current_job_id', job.job_id)
+      await this.loadHistory()
     },
     cancelUpload() {
       this.uploadController?.abort()

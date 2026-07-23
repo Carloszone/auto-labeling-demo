@@ -8,6 +8,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from app.core.defaults import SERVICE_DEFAULTS
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_FILE = Path(os.getenv("AUTO_LABEL_ENV_FILE", str(PROJECT_ROOT / ".env")))
@@ -23,19 +25,19 @@ def _project_path(value: str) -> Path:
 class Settings:
     """Runtime settings intentionally kept small for the single-job MVP."""
 
-    host: str = os.getenv("AUTO_LABEL_HOST", "0.0.0.0")
-    port: int = int(os.getenv("AUTO_LABEL_PORT", "8000"))
-    workspace_root: Path = Path(os.getenv("AUTO_LABEL_WORKSPACE_ROOT", "/tmp/auto-labeling-demo"))
-    max_upload_bytes: int = int(os.getenv("AUTO_LABEL_MAX_UPLOAD_BYTES", str(50 * 1024**3)))
-    min_free_bytes: int = int(os.getenv("AUTO_LABEL_MIN_FREE_BYTES", str(6 * 1024**3)))
-    worker_id: int = int(os.getenv("AUTO_LABEL_WORKER_ID", "1"))
+    host: str = os.getenv("AUTO_LABEL_HOST", str(SERVICE_DEFAULTS["host"]))
+    port: int = int(os.getenv("AUTO_LABEL_PORT", str(SERVICE_DEFAULTS["port"])))
+    workspace_root: Path = Path(os.getenv("AUTO_LABEL_WORKSPACE_ROOT", str(SERVICE_DEFAULTS["workspace_root"])))
+    max_upload_bytes: int = int(os.getenv("AUTO_LABEL_MAX_UPLOAD_BYTES", str(SERVICE_DEFAULTS["max_upload_bytes"])))
+    min_free_bytes: int = int(os.getenv("AUTO_LABEL_MIN_FREE_BYTES", str(SERVICE_DEFAULTS["min_free_bytes"])))
+    worker_id: int = int(os.getenv("AUTO_LABEL_WORKER_ID", str(SERVICE_DEFAULTS["worker_id"])))
     vlm_endpoint: str = os.getenv("AUTO_LABEL_VLM_ENDPOINT", "")
-    vlm_timeout_sec: float = float(os.getenv("AUTO_LABEL_VLM_TIMEOUT_SEC", "300"))
-    frontend_dist: Path = Path(os.getenv("AUTO_LABEL_FRONTEND_DIST", "frontend/dist"))
-    log_path: Path = _project_path(os.getenv("AUTO_LABEL_LOG_PATH", "logs/auto-labeling-demo.log"))
-    log_level: str = os.getenv("AUTO_LABEL_LOG_LEVEL", "INFO")
-    log_max_bytes: int = int(os.getenv("AUTO_LABEL_LOG_MAX_BYTES", str(20 * 1024**2)))
-    log_backup_count: int = int(os.getenv("AUTO_LABEL_LOG_BACKUP_COUNT", "5"))
+    vlm_timeout_sec: float = float(os.getenv("AUTO_LABEL_VLM_TIMEOUT_SEC", str(SERVICE_DEFAULTS["vlm_timeout_sec"])))
+    frontend_dist: Path = Path(os.getenv("AUTO_LABEL_FRONTEND_DIST", str(SERVICE_DEFAULTS["frontend_dist"])))
+    log_path: Path = _project_path(os.getenv("AUTO_LABEL_LOG_PATH", str(SERVICE_DEFAULTS["log_path"])))
+    log_level: str = os.getenv("AUTO_LABEL_LOG_LEVEL", str(SERVICE_DEFAULTS["log_level"]))
+    log_max_bytes: int = int(os.getenv("AUTO_LABEL_LOG_MAX_BYTES", str(SERVICE_DEFAULTS["log_max_bytes"])))
+    log_backup_count: int = int(os.getenv("AUTO_LABEL_LOG_BACKUP_COUNT", str(SERVICE_DEFAULTS["log_backup_count"])))
 
 
 settings = Settings()

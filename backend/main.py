@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 import av
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
@@ -19,6 +19,7 @@ from app.core.defaults import (
     DEFAULT_INPUT_PROMPT,
     EVENT_GENERATION_DEFAULTS,
     EVENT_LABELING_DEFAULTS,
+    MULTI_MCAP_POLICY,
     PARSER_DEFAULTS,
     copy_defaults,
 )
@@ -108,7 +109,7 @@ async def health() -> dict:
 async def config() -> dict:
     return {
         "max_upload_bytes": settings.max_upload_bytes,
-        "fps": 30,
+        "fps": MULTI_MCAP_POLICY["fps"],
         "default_input_prompt": DEFAULT_INPUT_PROMPT,
         "pipeline_defaults": {
             "parser_config": copy_defaults(PARSER_DEFAULTS),
@@ -125,13 +126,19 @@ async def create_job(
     robot_config: UploadFile = File(...),
     mcaps: list[UploadFile] | None = File(default=None),
     mcap: UploadFile | None = File(default=None),
+    draft_job_id: str | None = Form(default=None),
 ) -> dict:
     uploads = list(mcaps or [])
     if mcap is not None:
         uploads.append(mcap)
     if not uploads:
         raise ApiError(400, "INVALID_MCAP", "至少需要上传一个 MCAP 文件")
-    return await jobs.create_job(uploads, robot_config)
+    return await jobs.create_job(uploads, robot_config, draft_job_id)
+
+
+@app.post("/api/v1/jobs/new", status_code=201)
+async def new_job() -> dict:
+    return jobs.new_job()
 
 
 @app.get("/api/v1/jobs/current")

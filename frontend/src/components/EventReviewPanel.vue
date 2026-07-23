@@ -12,10 +12,10 @@ const emit = defineEmits<{
   save: [id: string, patch: EventPatch, done: (success: boolean) => void]
   review: [id: string, status: ReviewStatus]
   seek: [time: number]
-  filter: [cameraKeys: string[]]
+  filter: [triggerTopicKeys: string[]]
 }>()
 
-const selectedCameras = ref<string[]>([])
+const selectedTriggerTopics = ref<string[]>([])
 const activeTab = ref('events')
 const selectedEventId = ref('')
 const eventList = ref<HTMLElement | null>(null)
@@ -24,8 +24,8 @@ const dirty = reactive<Record<string, boolean>>({})
 const anomalyStatuses = reactive<Record<string, ReviewStatus>>({})
 const anomalyTopics = reactive<Record<'data' | 'image', string[]>>({ data: [], image: [] })
 
-const cameras = computed(() => [...new Set(props.events.map(item => item.baseline_camera_key))])
-const visibleEvents = computed(() => props.events.filter(item => !selectedCameras.value.length || selectedCameras.value.includes(item.baseline_camera_key)))
+const triggerTopics = computed(() => [...new Set(props.events.map(item => item.trigger_topic_key))])
+const visibleEvents = computed(() => props.events.filter(item => !selectedTriggerTopics.value.length || selectedTriggerTopics.value.includes(item.trigger_topic_key)))
 const activeEvent = computed(() => visibleEvents.value.find(item =>
   props.currentTime >= item.start_sec && props.currentTime <= item.end_sec,
 ))
@@ -40,7 +40,7 @@ watch(() => props.events, events => {
     if (!dirty[event.id]) drafts[event.id] = { ...event }
   }
 }, { immediate: true, deep: true })
-watch(selectedCameras, value => emit('filter', [...value]), { deep: true })
+watch(selectedTriggerTopics, value => emit('filter', [...value]), { deep: true })
 watch(() => activeEvent.value?.id, async id => {
   if (!id || activeTab.value !== 'events') return
   await nextTick()
@@ -101,15 +101,15 @@ onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
         <el-tag type="success">接受 {{ counts.accepted }}</el-tag>
         <el-tag type="danger">舍弃 {{ counts.rejected }}</el-tag>
       </div>
-      <el-checkbox-group v-model="selectedCameras" size="small">
-        <el-checkbox-button v-for="camera in cameras" :key="camera" :value="camera">{{ camera }}</el-checkbox-button>
+      <el-checkbox-group v-model="selectedTriggerTopics" size="small">
+        <el-checkbox-button v-for="topic in triggerTopics" :key="topic" :value="topic">{{ topic }}</el-checkbox-button>
       </el-checkbox-group>
     </div>
     <el-empty v-if="!events.length" description="标注完成后将在此展示 Event" />
     <div ref="eventList" class="event-list">
       <el-card v-for="event in visibleEvents" :key="event.id" :data-event-id="event.id" class="event-card" :class="[event.review_status, { 'playback-active': activeEvent?.id === event.id, selected: selectedEventId === event.id }]" shadow="never" @click="selectEvent(event, $event)">
         <template #header>
-          <button class="event-link" @click="selectedEventId = event.id; emit('seek', event.start_sec)">{{ event.id }} · {{ event.baseline_camera_key }}</button>
+          <button class="event-link" @click="selectedEventId = event.id; emit('seek', event.start_sec)">{{ event.id }} · {{ event.trigger_topic_key }}</button>
           <el-tag :type="event.review_status === 'accepted' ? 'success' : event.review_status === 'rejected' ? 'danger' : 'warning'">{{ event.review_status }}</el-tag>
         </template>
         <template v-if="drafts[event.id]">

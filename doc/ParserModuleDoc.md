@@ -54,7 +54,7 @@
   },
   "insert": {
     "rotation": "ZYX",
-    "max_tor_time_sec": 0.2
+    "max_tor_time_ns": 3
   },
   "output_format": {
     "include_vector_view": true,

@@ -93,8 +93,26 @@ class RunRequest(BaseModel):
             self.event_labeling_config, ("sampling", "params", "fixed_frame_len"), 1, 20
         )
         _validate_integer(
+            self.event_labeling_config,
+            ("sampling", "params", "sampling_frame_gap"),
+            1,
+            1_000_000,
+        )
+        _validate_integer(
             self.event_labeling_config, ("sampling", "params", "context_frame_len"), 0, 10
         )
+        _validate_number(
+            self.event_labeling_config, ("vlm_params", "temperature"), 0, 2
+        )
+        _validate_integer(
+            self.event_labeling_config, ("vlm_params", "max_output_tokens"), 1, 1_000_000
+        )
+        reasoning = _at(self.event_labeling_config, ("vlm_params", "reasoning"))
+        if reasoning is not None and reasoning not in {"off", "on"}:
+            raise ValueError("event_labeling_config.vlm_params.reasoning must be off or on")
+        store = _at(self.event_labeling_config, ("vlm_params", "store"))
+        if store is not None and not isinstance(store, bool):
+            raise ValueError("event_labeling_config.vlm_params.store must be a boolean")
         return self
 
 

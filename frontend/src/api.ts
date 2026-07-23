@@ -16,7 +16,7 @@ export interface JobSummary {
   file_names: string[]
   mcap_count: number
   file_size_bytes: number
-  status: 'validating' | 'ready_to_run' | 'running' | 'ready' | 'failed'
+  status: 'draft' | 'validating' | 'ready_to_run' | 'running' | 'ready' | 'failed'
   stage: string
   progress: number
   message: string
@@ -52,6 +52,8 @@ export interface EventView {
   id: string
   topic_key: string
   source_topic: string
+  trigger_topic_key: string
+  trigger_source_topic: string
   start_sec: number
   end_sec: number
   prompt: string
@@ -108,15 +110,18 @@ export const api = {
   getCurrentJob: (signal?: AbortSignal) => http.get<JobSummary>('/jobs/current', { signal }).then(r => r.data),
   getJobHistory: (signal?: AbortSignal) => http.get<JobSummary[]>('/jobs/history', { signal }).then(r => r.data),
   getJob: (jobId: string, signal?: AbortSignal) => http.get<JobSummary>(`/jobs/${jobId}`, { signal }).then(r => r.data),
+  newJob: () => http.post<JobSummary>('/jobs/new').then(r => r.data),
   createJob: (
     mcaps: File[],
     robotConfig: File,
+    draftJobId: string,
     onProgress: (value: number) => void,
     signal?: AbortSignal,
   ) => {
     const form = new FormData()
     for (const mcap of mcaps) form.append('mcaps', mcap)
     form.append('robot_config', robotConfig)
+    form.append('draft_job_id', draftJobId)
     return http.post<JobSummary>('/jobs', form, {
       signal,
       timeout: 0,

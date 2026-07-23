@@ -68,7 +68,8 @@
 
 - `event_points`：按摄像头 `topic_key` 分组；每组内部按时间排序，`order_id` 从 1 开始。
 - `event_periods`：按同一 `topic_key` 分组的半闭半开区间列表。
-- `topic_key` / `source_topic`：区间所属摄像头的结构化 key 和原始 topic，供后续筛选。
+- `topic_key` / `source_topic`：区间取帧所用摄像头的结构化 key 和原始 topic。
+- `trigger_topic_key` / `trigger_source_topic`：实际生成区间节点的 gripper key 和原始 topic，供事件归属与筛选；事件配对按 camera 与 gripper 的组合隔离。
 - `source_trigger_index`：输入 `trigger_points` 中的位置，用于追溯。
 
 空输入返回 `event_points: {}` 和 `event_periods: {}`。某个 topic 只有一个节点时，保留该 topic 的节点，区间列表为空。

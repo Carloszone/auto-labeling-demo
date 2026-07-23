@@ -13,6 +13,7 @@ button { font: inherit; }
 .prompt-heading code { color: #409eff; }
 .prompt-details { margin-top: 4px; }
 .job-status { display: grid; grid-template-columns: auto auto auto 1fr minmax(280px, 35%); align-items: center; gap: 12px; margin-top: 12px; }
+.segment-manifest { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 10px; font-size: 12px; }
 .workspace { display: grid; grid-template-columns: minmax(0, 65fr) minmax(420px, 35fr); gap: 12px; margin-top: 22px; height: calc(100vh - 320px); min-height: 720px; }
 .media-column { min-width: 0; padding: 12px; overflow: auto; }
 .review-panel { background: #fff; border: 1px solid #e5e8ef; border-radius: 8px; min-width: 0; overflow: hidden; display: flex; flex-direction: column; }

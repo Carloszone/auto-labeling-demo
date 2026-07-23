@@ -14,7 +14,7 @@
 
 MVP 阶段先聚焦本地 MCAP 文件输入，不考虑远程下载、前端交互、数据库任务管理和并发调度。核心流程需要完成解析、质量/trigger 检测、事件节点与区间生成、事件标注，最终输出可供训练数据清洗、人工复核和后续数据转换使用的标注 JSON。
 
-参数约定：所有持续时间、窗口时长、间隔和容差配置统一使用秒，并以 `_sec` 结尾；内部固定按 `fps=30` 换算为对齐帧数。必须继续以离散帧表达的参数，名称中包含 `frame`，例如 `window_frame_length`、`jump_frames`、`fixed_frame_len` 和 `context_frame_len`。
+参数约定：所有持续时间、窗口时长、间隔和容差配置统一使用秒，并以 `_sec` 结尾；内部固定按 `fps=30` 换算为对齐帧数。必须继续以离散帧表达的参数，名称中包含 `frame`，例如 `window_frame_length`、`jump_frames`、`fixed_frame_len`、`sampling_frame_gap` 和 `context_frame_len`。
 
 第一版目标如下：
 

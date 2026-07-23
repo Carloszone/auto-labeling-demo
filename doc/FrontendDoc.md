@@ -136,7 +136,7 @@ AutoLabelingDemoPage
 
 重置规则：
 
-- 创建新工作项成功后重置视频、筛选、event 草稿和导出状态。
+- 点击“新建”后立即创建 draft Job ID，归档已完成的当前工作项，并重置视频、上传文件列表、筛选、event 草稿和导出状态。
 - job ID 变化时取消所有旧 job 请求。
 - 后端返回 `JOB_NOT_FOUND` 时删除 sessionStorage 中的 job ID并回到初始页面。
 
@@ -148,6 +148,7 @@ AutoLabelingDemoPage
 - robot config：只允许一个 `.json`，前端上限 2 MiB。
 - 两个文件均选择后启用“上传并创建工作项”。
 - 文件选择使用 Element Plus `el-upload` 的手动模式，不自动发请求。
+- MCAP 和 Robot Config 只能在 `draft` 工作项中选择；“新建”会同时调用两个上传组件的 `clearFiles()`，防止文件列表继承上一工作项。
 
 ### 8.2 请求
 
@@ -267,7 +268,7 @@ POST /api/v1/jobs/{job_id}/run
 ### 13.1 展示
 
 - 顶部显示总数及 pending/accepted/rejected 数量。
-- `baseline_camera_key` 使用 Checkbox Group 多选筛选，默认全选。
+- `trigger_topic_key` 使用 Checkbox Group 多选筛选，默认全选；`baseline_camera_key` 继续用于标识 VLM 取帧摄像头。
 - 卡片显示时间、topic、动作摘要、action_state、review_status 和 description。
 - 字段名 `prompt` 在 UI 上显示为“动作摘要”，API 字段保持 `prompt`。
 - 播放时间进入某个可见 event 区间时，该卡片显示播放命中高亮，并自动滚动到右侧列表中央。
@@ -401,6 +402,7 @@ deleteJob(jobId)
 
 ## 20. 更新记录
 
+- 2026-07-16：上传并创建新工作项期间禁用自动标注，防止后端已轮转当前 Job、前端仍显示旧 Job 时误触发 `HISTORY_READ_ONLY`。
 - 2026-07-16：精简默认 User Prompt；System Prompt 从只读展示改为可编辑文本框，支持恢复默认并随运行请求提交。
 - 2026-07-15：顶部新增最近 5 次成功标注 Job 下拉切换，历史任务只读运行但可复核和导出。
 - 2026-07-15：工作项输入扩展为多 MCAP；明确上传顺序不参与拼接排序，内部时间轴和边界策略不向页面开放。

@@ -35,29 +35,51 @@ class TriggerEventGenerator:
         timeline = [int(item["timestamp_ns"]) for item in timestamps]
         if any(left >= right for left, right in zip(timeline, timeline[1:])):
             raise ValueError("timestamp_list must be strictly monotonic increasing")
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        seen: set[tuple[str, int]] = set()
+        grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        seen: set[tuple[str, str, int]] = set()
         for source_index, trigger in enumerate(triggers):
             self._validate_trigger(trigger, timestamps)
-            identity = (str(trigger["topic_key"]), int(trigger["timestamp_index"]))
+            camera_topic_key = str(trigger["topic_key"])
+            trigger_topic_key = self._trigger_topic_key(trigger)
+            identity = (camera_topic_key, trigger_topic_key, int(trigger["timestamp_index"]))
             if identity in seen:
                 continue
             seen.add(identity)
-            grouped[identity[0]].append({**trigger, "source_trigger_index": source_index})
+            grouped[(camera_topic_key, trigger_topic_key)].append(
+                {**trigger, "source_trigger_index": source_index}
+            )
 
         event_points: dict[str, dict[int, dict[str, Any]]] = {}
         event_periods: dict[str, list[dict[str, Any]]] = {}
-        for topic_key in sorted(grouped):
-            points = sorted(grouped[topic_key], key=lambda item: int(item["timestamp_ns"]))
+        for camera_topic_key, trigger_topic_key in sorted(grouped):
+            points = sorted(
+                grouped[(camera_topic_key, trigger_topic_key)],
+                key=lambda item: int(item["timestamp_ns"]),
+            )
             ordered = {order: point for order, point in enumerate(points, start=1)}
-            event_points[topic_key] = ordered
-            event_periods[topic_key] = self._pair_adjacent(ordered, timestamps, topic_key)
+            group_key = (
+                camera_topic_key
+                if trigger_topic_key == camera_topic_key
+                else f"{trigger_topic_key}::{camera_topic_key}"
+            )
+            event_points[group_key] = ordered
+            event_periods[group_key] = self._pair_adjacent(
+                ordered, timestamps, camera_topic_key, trigger_topic_key
+            )
         return {
             "task_id": basic["task_id"],
             "job_id": basic.get("job_id"),
             "event_points": event_points,
             "event_periods": event_periods,
         }
+
+    def _trigger_topic_key(self, trigger: dict[str, Any]) -> str:
+        """Return the gripper topic key that actually produced the trigger."""
+
+        evidence = trigger.get("evidence")
+        if isinstance(evidence, dict) and evidence.get("detection_topic_key"):
+            return str(evidence["detection_topic_key"])
+        return str(trigger["topic_key"])
 
     def _validate_trigger(self, trigger: Any, timestamps: list[dict[str, str]]) -> None:
         """Validate one unlabeled trigger against the aligned main timeline."""
@@ -79,6 +101,7 @@ class TriggerEventGenerator:
         event_points: dict[int, dict[str, Any]],
         timestamps: list[dict[str, str]],
         topic_key: str,
+        trigger_topic_key: str,
     ) -> list[dict[str, Any]]:
         """Create one period for every adjacent node pair in a single topic timeline."""
 
@@ -97,6 +120,8 @@ class TriggerEventGenerator:
                     end_order,
                     topic_key,
                     str(start["source_topic"]),
+                    trigger_topic_key,
+                    str(start.get("evidence", {}).get("detection_source_topic", start["source_topic"])),
                 )
             )
         return periods
@@ -110,6 +135,8 @@ class TriggerEventGenerator:
         end_order: int,
         topic_key: str,
         source_topic: str,
+        trigger_topic_key: str,
+        trigger_source_topic: str,
     ) -> dict[str, Any]:
         """Create public time fields and retain the owning camera topic."""
 
@@ -122,6 +149,8 @@ class TriggerEventGenerator:
             "end_event_order_id": end_order,
             "topic_key": topic_key,
             "source_topic": source_topic,
+            "trigger_topic_key": trigger_topic_key,
+            "trigger_source_topic": trigger_source_topic,
             "start_index": start_index,
             "end_index": end_index,
             "startSec": f"{start_rel_ns / 1_000_000_000:.3f}",

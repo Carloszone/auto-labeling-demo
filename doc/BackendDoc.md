@@ -100,7 +100,9 @@ FastAPI :8000
    - 在后台线程串行调用算法模块。
    - 更新阶段进度和错误信息。
 5. `VideoArtifactService`
-   - 使用 Parser 对齐后的 `image_list` 生成各相机 MP4。
+   - 通过独立 Python 工作进程执行 Parser，并使用对齐后的 `image_list` 为全部配置相机生成固定 30 FPS MP4。
+   - 子进程只落盘不含图像的 `parser_compact.pkl`；退出后由操作系统回收 Parser、JPEG 和编码器堆内存。
+   - 主进程只加载 `video_paths`、时间轴、state/action 和 manifest；后续模块按帧索引解码。
    - 主相机失败则任务失败；非主相机失败记录 warning 并继续。
 8. `MultiMcapPreflightService`
    - 仅读取每个 MCAP 的 `main_time_topic` 元数据，按实际起止时间戳排序。
@@ -161,7 +163,7 @@ CurrentJob
 - `overlap_policy=earlier_mcap_wins`：按主相机记录时间戳排序后，重叠部分保留前一个 MCAP。
 - `large_gap_policy=fail`：边界缺口达到视频补帧阈值时任务失败；较小缺口允许重复最近图像帧并对连续运动量插值。
 
-上传写入仍采用 `.part` 加原子改名。预扫描全部成功后才正式解析；原始 MCAP 按实际时间顺序逐文件读取，不同时将多个原始文件内容载入内存。第一版下游兼容层仍会保存拼接后的 JPEG 压缩 `image_list`，后续磁盘化阶段将改为图像质检流式执行、VLM 按帧索引回读原始 MCAP。
+上传写入仍采用 `.part` 加原子改名。预扫描、解析和视频编码位于独立工作进程；原始 MCAP 按实际时间顺序读取。工作进程完成全部 MP4 后，原子写入不含图像的 `parser_compact.pkl`，再正常退出。主进程随后加载紧凑结果，DataCheck 顺序解码 MP4，EventLabeling 根据事件帧索引精确读取 MP4；主进程从不接收 `image_list`。工作进程非零退出、被信号杀死或没有产生紧凑结果时，任务进入 `failed` 并保留 stderr 摘要。
 
 `AnomalyRangeView.topics` 为单一 topic 字符串，`descs` 为字符串列表。DataCheck 当前只在同 topic、同异常类型内执行区间合并，禁止跨 topic 融合。异常复核状态属于前端临时展示状态，不通过后端保存，也不影响导出。
 
@@ -190,7 +192,9 @@ CurrentJob
 │   └── segment_NNN.mcap.part
 ├── metadata/
 │   ├── segments.json
-│   └── frames.json
+│   ├── frames.json
+│   ├── artifact_worker_request.json
+│   └── parser_compact.pkl
 ├── config/
 │   ├── robot.json
 │   └── effective_pipeline.json
@@ -258,8 +262,8 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 | 阶段 | 进度范围 | 计算方式 |
 |---|---:|---|
 | `validating` | 0–5 | 配置与文件校验完成后到 5 |
-| `parsing` | 5–25 | Parser 暂无内部回调，进入时 5，完成时 25 |
-| `video_generating` | 25–40 | 按已完成摄像头数线性计算 |
+| `parsing` | 5–25 | 独立工作进程执行 Parser 和 MP4 编码，完成后到 25 |
+| `video_generating` | 25–40 | 主进程登记工作进程生成的视频产物后进入 40 |
 | `data_checking` | 40–60 | 进入时 40，完成时 60 |
 | `event_generating` | 60–65 | 进入时 60，完成时 65 |
 | `vlm_labeling` | 65–95 | 按已完成 event 数线性计算；无 event 直接到 95 |
@@ -269,12 +273,14 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 
 ## 9. 视频规范
 
-- 输入：Parser 返回的对齐 `image_list`。
-- 每个 `robot_config.cameras[].output_video=true` 的相机生成一个文件。
+- 输入：独立工作进程内 Parser 返回的对齐 `image_list`；该对象不会通过进程边界返回主进程。
+- 每个配置相机都生成一个文件，作为前端播放、图像质检和 VLM 抽帧的统一帧存储。
 - 编码：H.264，像素格式 `yuv420p`，MP4 容器，30 FPS。
 - 使用 PyAV `libx264` 编码；当前 vla_main 环境已具备该 codec，不依赖系统 `ffmpeg` 命令。
 - 输出分辨率保持原图；宽或高为奇数时补齐到偶数。
 - MP4 写入完成前使用 `.part` 后缀，关闭容器后原子改名。
+- 编码帧的 PTS 等于零基 `frame_index`，time base 为 `1/30`。抽帧后必须校验解码器位置为 `frame_index + 1`，不得仅按播放秒数近似定位。
+- `timestamp_list[frame_index]` 和 `frames.json` 保存帧索引对应的业务时间戳；MP4 本身只承担固定帧率图像存储。
 - `main_time_topic` 对应相机是主视频；主视频失败则整个任务失败。
 - 非主视频失败时任务继续，`CameraInfo.generation_status=failed` 并写入 warnings。
 - 视频接口支持 `Range`、`206 Partial Content`、`Accept-Ranges: bytes` 和正确的 `Content-Length`。
@@ -305,7 +311,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
     "data_detection": {
       "sudden_change_config": {
         "window_time_sec": 0.5,
-        "z_score": 3.0,
+        "z_score": 5.0,
         "sudden_time_sec": 0.066666667,
         "step_time_sec": 0.5,
         "zcr_ratio": 0.4
@@ -320,7 +326,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
       "luminance": 10,
       "window_time_sec": 1.0,
       "lap_var": 150,
-      "z_score": 2.0,
+      "z_score": 5.0,
       "resize_length": 860,
       "resize_width": 640,
       "SSIM": 0.7,
@@ -336,6 +342,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
     "sampling": {
       "params": {
         "fixed_frame_len": 20,
+        "sampling_frame_gap": 5,
         "context_frame_len": 2
       }
     }
@@ -354,6 +361,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 - `degree`、`zcr_ratio`、`SSIM`、`moving_area_ratio`：0–1。
 - `resize_length/resize_width`：整数，64–4096。
 - `fixed_frame_len`：整数，1–20。
+- `sampling_frame_gap`：整数，1–1000000；候选采样数超限时后端自动扩大有效间隔。
 - `context_frame_len`：整数，0–10。
 - `main_time_topic`：必须匹配上传 robot config 中某个 camera topic。
 - `input_prompt`：去除首尾空白后最多 8000 个字符；空值使用后端默认 Prompt。
@@ -491,7 +499,7 @@ MVP 不实现取消。运行中执行启动、删除或覆盖均返回 409。失
 }
 ```
 
-当前工作项为 `running` 时返回 409；旧工作项为 `ready` 时归入最近成功历史，为 `ready_to_run` 或 `failed` 时清理后再创建新工作项。历史超过 5 条时清理最早完成项。
+`POST /api/v1/jobs/new` 会立即创建 `draft` 工作项并返回 Job ID。当前工作项为 `ready` 时先归入最近成功历史；为未完成状态时清理。当前工作项为 `running` 时返回 409。随后上传接口携带 `draft_job_id`，文件上传和校验复用该 Job ID。历史超过 5 条时清理最早完成项。
 
 ### 12.3 获取当前工作项
 
@@ -714,6 +722,8 @@ AnomalyRangeView 统一为：
 
 ## 16. 更新记录
 
+- 2026-07-16：EventLabeling 的 VLM 默认参数增加 `store: false`，关闭 LM Studio `/api/v1/chat` 的 prediction history 存储。
+- 2026-07-16：EventLabeling 页面参数新增 `sampling_frame_gap`，当前默认 5；`fixed_frame_len` 明确为 event 图片数量上限。
 - 2026-07-16：`RunRequest` 新增可选 `system_prompt`，最多 20000 字符；空值使用后端默认值，并与 User Prompt 一同写入有效配置后传给 EventLabeling。
 - 2026-07-15：新增最近 5 个成功工作项历史接口；历史项保留视频、标注、异常和复核能力，但禁止重新运行。
 - 2026-07-15：VLM HTTP 错误日志新增响应正文、状态码、内容类型、请求规模和截断标记，便于定位服务端 500。

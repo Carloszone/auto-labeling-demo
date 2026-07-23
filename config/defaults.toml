@@ -1,0 +1,230 @@
+# Auto-labeling Demo 的唯一默认参数源。
+# 修改默认行为时先改本文件，再更新 doc/TechnicalGuide.md；业务代码不得另建同义默认值。
+schema_version = 1
+
+[service]
+# HTTP 监听地址和端口。
+host = "0.0.0.0"
+port = 8000
+# 每次启动使用的临时工作目录。
+workspace_root = "/tmp/auto-labeling-demo"
+# 一次任务允许上传的 MCAP 总字节数（50 GiB）。
+max_upload_bytes = 53_687_091_200
+# 创建任务时要求工作盘至少保留的空间（6 GiB）。
+min_free_bytes = 6_442_450_944
+# Snowflake ID 的节点编号，范围 0..1023。
+worker_id = 1
+# 单次 VLM HTTP 请求超时，单位秒。VLM endpoint 必须由部署环境外部传入。
+vlm_timeout_sec = 300.0
+# 前端构建产物和日志配置。相对路径以项目根目录为基准。
+frontend_dist = "frontend/dist"
+log_path = "logs/auto-labeling-demo.log"
+log_level = "INFO"
+log_max_bytes = 20_971_520
+log_backup_count = 5
+
+[multi_mcap]
+# 物化视频和全局对齐时间轴的固定帧率。
+fps = 30
+# 小于该间隔视为连续数据，单位秒。
+continuous_gap_sec = 0.066666667
+# 视频允许通过邻近帧填充的最大间隔，单位秒。
+max_video_fill_gap_sec = 0.2
+# state/action 允许插值的最大间隔，单位秒。
+max_motion_interpolation_gap_sec = 0.2
+# 单个任务允许的最大 MCAP 分段数。
+max_segment_count = 32
+# 时间重叠时保留较早 MCAP 的数据。
+overlap_policy = "earlier_mcap_wins"
+# 超过允许间隙时使任务失败。
+large_gap_policy = "fail"
+
+[pipeline.parser.insert]
+# 欧拉角旋转顺序；当前四元数 SLERP 实现保留该兼容字段。
+rotation = "ZYX"
+# 其他 topic 与主时间帧最近邻对齐的最大容差，单位秒。
+max_tor_time_sec = 0.2
+
+[pipeline.parser.output_format]
+# 是否生成拼接后的数值向量视图。
+include_vector_view = true
+# 是否在结果中包含各 component 的 schema。
+include_component_schema = true
+
+[pipeline.data_check.basic]
+# 防止标准化和除法出现零分母的微小量。
+eps = 1e-9
+# 秒参数换算为帧数时使用的帧率。
+fps = 30
+
+[pipeline.data_check.basic.smooth]
+# 数值时序平滑算法。
+method = "savgol"
+# SG 滤波局部窗口长度，单位帧。
+window_frame_length = 10
+# SG 滤波窗口内拟合多项式的阶数，必须小于窗口长度。
+polyorder = 3
+
+[pipeline.data_check.data_detection.sudden_change_config]
+# 是否检测瞬时突变、台阶和振荡。
+enable = true
+# 统计窗口时长，单位秒。
+window_time_sec = 0.5
+# 异常 z-score 阈值。
+z_score = 5.0
+# 尖峰允许的最大持续时间，单位秒。
+sudden_time_sec = 0.066666667
+# 台阶稳定持续时间，单位秒。
+step_time_sec = 0.5
+# 振荡判断所需的过零比例。
+zcr_ratio = 0.4
+
+[pipeline.data_check.data_detection.extreme_value_config]
+# 是否检测超出运动范围的数值。
+enable = true
+# 靠近边界时视为极值的归一化比例。
+degree = 0.01
+# 根据观测范围扩展合法边界的系数。
+expansion_coef = 0.2
+# 极值比较使用的最小容差。
+min_tor = 0.0001
+
+[pipeline.data_check.image_detection]
+# 是否执行图像质量检查。
+enable = true
+# 黑帧检测的平均亮度下限。
+luminance = 10.0
+# 模糊历史统计窗口，单位秒。
+window_time_sec = 1.0
+# Laplacian 方差低于该值时判定为模糊。
+lap_var = 150.0
+# 相对历史清晰度下降的 z-score 阈值。
+z_score = 5.0
+# 质检时缩放后的宽度和高度。
+resize_length = 860
+resize_width = 640
+# 预留的结构相似度阈值。
+SSIM = 0.7
+# 相邻帧平均像素差阈值。
+pixel_mae = 5.0
+# 发生变化的像素比例阈值。
+moving_area_ratio = 0.05
+
+[pipeline.data_check.trigger_detection]
+# 当前 trigger 检测器类型。
+mode = "end_effector"
+
+[pipeline.data_check.trigger_detection.params]
+# 变化点候选算法和代价模型。
+algorithm = "Pelt"
+model = "clinear"
+# PELT 惩罚系数。
+pen = 15.0
+# 状态至少持续的时间，单位秒。
+min_duration_sec = 1.0
+# PELT 搜索步长，单位帧。
+jump_frames = 1
+# HSMM 近似使用的状态数量。
+state_count = 3
+# 局部运动特征窗口，单位秒。
+feature_window_sec = 0.166666667
+# 状态保持概率。
+stay_probability = 0.995
+# 候选边界软先验的高斯宽度，单位秒。
+candidate_sigma_sec = 1.333333333
+# 候选边界软先验权重。
+candidate_bonus = 1.0
+
+[pipeline.data_check.merge_policy]
+# 异常至少持续该时长才输出，单位秒。
+min_low_quality_time_sec = 0.166666667
+# 同类异常合并时允许的最大间隔，单位秒。
+max_gap_time_sec = 0.2
+
+[pipeline.event_generation.point_policy]
+# trigger 点处理策略；pass_through 表示不额外筛选。
+mode = "pass_through"
+
+[pipeline.event_generation.pairing_policy]
+# 按 topic 将相邻 trigger 配对为事件区间。
+mode = "adjacent_by_topic"
+
+[pipeline.event_labeling.sampling]
+# 事件图像采样策略。
+mode = "fixed_sequence"
+
+[pipeline.event_labeling.sampling.params]
+# 单个事件最多采样的事件帧数。
+fixed_frame_len = 20
+# 事件区间内采样步长，单位帧；超过上限时会自动增大。
+sampling_frame_gap = 5
+# 事件前后各附加的上下文帧数。
+context_frame_len = 2
+
+[pipeline.event_labeling.vlm_params]
+# 默认模型名；VLM endpoint 必须由部署环境外部传入。
+model = "qwen/qwen3.5-9b"
+# 是否要求 VLM 服务保存请求。
+store = false
+# 是否启用模型推理输出。
+reasoning = "off"
+# 模型采样温度。
+temperature = 0.7
+# 单次响应允许的最大输出 token 数。
+max_output_tokens = 1024
+input_prompt = "这是一段机器人操作视频的关键帧序列，请描述机器人完成的任务，使用中文描述其进行的动作和环境细节信息。"
+system_prompt = """
+[Role]
+你是一位拥有丰富视觉几何与机器人控制背景的具身智能数据标注专家。你的任务是分析（第一人称手眼相机或第三人称固定相机视角的）机器人操作视频关键帧序列，识别精确的空间信息和操作细节，并判断动作结果。
+
+[1. 核心动作状态机 (Action Primitives)]
+你必须严格根据机械臂末端执行器（EOAT/夹爪）的物理状态和运动趋势，将机器人的动作分类为以下 5 种基础状态：
+- 动作测试 (Calibration)：夹爪在原地（通常在半空中）进行单次或多次的张开与闭合。核心特征是：**夹爪与环境中任何潜在目标物体之间的相对距离保持不变或轻微变动，没有明显的空间平移趋势**。
+- 靠近 (Approach)：夹爪处于张开（非夹持）状态，且**必须正在向明确的目标物体移动（视觉上表现为夹爪与目标物的空间绝对距离正在显著缩小）**。
+- 拿起 (Grasp)：夹爪尝试夹取物体；夹爪状态由张开（非夹持）转为闭合（夹持）。
+- 移动 (Move)：夹爪保持闭合（夹持）状态，并带着夹持的物体进行平移或旋转。
+- 放下 (Release)：夹爪松开物体；状态由闭合（夹持）转为张开（非夹持）以释放物体。
+- 远离/复位 (Retract/Reset)：夹爪处于张开（非夹持）状态，并向远离物体的方向移动（视觉上表现为夹爪与目标物的空间绝对距离正在显著增大）。特殊情况：如果夹爪尝试回到启动前的初始位姿，则分类为“复位”。
+
+[2. 场景与属性规范 (Scene & Attribute Rules)]
+在描述环境细节与交互时，必须严格遵守以下注意力层级，避免受到干扰：
+1. 聚焦“前景交互轴”：绝对优先关注机器人夹爪（EOAT）与目标交互物件。必须准确识别它们的视觉属性（颜色、材质、形状、状态）。
+2. 描述“直接环境”：描述交互发生的支撑面（如木制桌面、黑色垫子）和相关的局部容器（如黑色收纳盒、托盘）。
+3. 忽略“背景干扰”：绝对忽略背景中走动的人员、远处的架子、闪烁的光影或与当前操作无关的设备。除非它们与机器人发生了物理碰撞，否则不要在描述中提及。
+
+[3. 视角与相对关系 (Spatial Perspective)]
+- 坐标系约束：描述方位时（如“左/中/右”、“前方/后方”、“上/下”），必须始终以机器人本体坐标系为基准。
+- 手眼相机（Eye-in-Hand）规则：当相机安装在机械臂末端时，夹爪在画面中的相对位置基本保持不变。“靠近”物体在视觉上表现为目标物体和背景在画面中逐渐放大；“远离”则表现为目标物体和背景逐渐缩小。不能因为夹爪在画面中没移动，就判定为“无意义动作”。
+- 遮挡处理：即使机器人暂时遮挡了物体的一部分，也要根据前后帧的逻辑推断物体状态，不要因为暂时性的视觉遮挡而判定“物体消失”。
+
+[4. 结果判定规则 (Action State Ruler)]
+- 成功 (1)：机器人成功执行了当前意图（如稳定抓取目标物并将其移动，或顺利放下）并维持了稳定状态。
+- 失败 (-1)：发生以下情况之一即判定为失败：触碰但未能抓起（滑脱）；抓取偏离中心导致姿态不稳定；机器人在移动过程中意外丢失/掉落目标。
+- 无法判断 (0)：视频片段截断不完整，或者动作无法清晰归类至上述状态。
+
+[5. 输出格式与规范 (Output Schema)]
+动作描述必须用词精炼保留以下信息要素：[动作/尝试动作] + [交互物件（带属性）]。
+- 动作描述示例1：夹爪靠近签字笔
+- 动作描述示例2：夹爪尝试放下签字笔
+
+环境细节描述必须严格保留以下信息要素：[动作/尝试动作] + [交互物件（带属性）] + [地点/环境]。
+- 细节示例1：“尝试靠近木制桌面上的黄色方块”、“尝试将黄色瓶子放入黑色的盒子中”
+- 细节示例2：“黑色的夹爪在木制桌面上方缓慢下降，尝试靠近并拿起静止在黑色垫子上的黄色方块。桌面上另有3个红色球体处于静止状态。”
+
+【严厉警告】必须严格且仅以 JSON 格式输出，不要包含任何思考过程、解释、Markdown代码块标记（如 ```json ）或其他自然语言对话！
+{
+"action_summary": "简洁的动作摘要，格式必须包含 [动作/尝试动作] + [交互物件]",
+"action_state": 1,
+"detailed_description": "环境细节描述。描述详细的场景、环境属性、前景交互目标与机械臂动作的细节描述，必须严格区分颜色、形状、相对空间位置，彻底忽略背景人员干扰"
+}
+"""
+
+[pipeline.event_labeling.output]
+# 最终标注所属层级和类别。
+layerId = "l2"
+category = "detail"
+
+[pipeline.event_labeling.output.attributes]
+# 默认场景属性。
+scene = "tabletop"
+sceneTags = []
